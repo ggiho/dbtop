@@ -1,0 +1,24 @@
+# For the throwaway databases in dev/compose.yaml. Plaintext passwords are fine here, and only here:
+# dbtop refuses a config that holds one unless the file is private (chmod 600).
+[connections.local-mysql]
+kind = "mysql"
+host = "127.0.0.1"
+port = 13306
+user = "dbtop"
+password = "dbtop"
+
+[connections.local-pg]
+kind = "postgres"
+host = "127.0.0.1"
+port = 15432
+user = "dbtop"
+password = "dbtop"
+database = "shop"
+
+# The same, but the secret comes from a command instead of the file.
+[connections.local-mysql-cmd]
+kind = "mysql"
+host = "127.0.0.1"
+port = 13306
+user = "dbtop"
+password_cmd = "echo dbtop"

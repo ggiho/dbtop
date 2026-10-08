@@ -1,0 +1,84 @@
+# Throwaway databases for developing and testing dbtop. Never point dbtop's tests at anything else.
+#
+#   docker compose -f dev/compose.yaml up -d --wait            # mysql 8.0 + postgres 16
+#   docker compose -f dev/compose.yaml --profile extra up -d --wait   # + performance_schema OFF, postgres 13
+#   docker compose -f dev/compose.yaml down -v
+#
+# Ports are bound to 127.0.0.1 only. Superuser password is "root"; the monitoring user is
+# dbtop/dbtop with just the privileges dbtop needs (see the init scripts).
+name: dbtop-dev
+
+services:
+  mysql:
+    image: mysql:8.0
+    # Both loopbacks: `localhost` resolves to ::1 first, and the certificate names only localhost.
+    ports: ["127.0.0.1:13306:3306", "[::1]:13306:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    # TLS with a certificate made at start-up by tls-setup.sh. It names localhost but NOT 127.0.0.1,
+    # so connecting by IP is a real host name mismatch for the tests to see.
+    entrypoint: ["/bin/bash", "-c", "sh /usr/local/bin/tls-setup.sh mysql:mysql mysql DNS:localhost && exec docker-entrypoint.sh \"$$@\"", "dbtop"]
+    command: ["mysqld", "--ssl-ca=/etc/dbtop-tls/ca.pem", "--ssl-cert=/etc/dbtop-tls/server.pem", "--ssl-key=/etc/dbtop-tls/server.key"]
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./tls-setup.sh:/usr/local/bin/tls-setup.sh:ro
+      - ./certs:/certs-out
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent && mysql -h 127.0.0.1 -udbtop -pdbtop -e 'select 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+
+  postgres:
+    image: postgres:16
+    ports: ["127.0.0.1:15432:5432", "[::1]:15432:5432"]
+    environment:
+      POSTGRES_PASSWORD: root
+    # TLS with a certificate made at start-up by tls-setup.sh. Like MySQL's it names localhost but
+    # NOT 127.0.0.1, so connecting by IP is a real host name mismatch for the tests to see.
+    entrypoint: ["/bin/bash", "-c", "sh /usr/local/bin/tls-setup.sh postgres:postgres postgres DNS:localhost && exec docker-entrypoint.sh \"$$@\"", "dbtop"]
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "ssl=on", "-c", "ssl_cert_file=/etc/dbtop-tls/server.pem", "-c", "ssl_key_file=/etc/dbtop-tls/server.key"]
+    volumes:
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./tls-setup.sh:/usr/local/bin/tls-setup.sh:ro
+      - ./certs:/certs-out
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=dbtop psql -h 127.0.0.1 -U dbtop -d shop -c 'select 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+
+  # What an Aurora/RDS instance looks like with performance_schema left off. It offers no TLS
+  # either, to see `prefer` fall back to a plain connection.
+  mysql-no-ps:
+    profiles: ["extra"]
+    image: mysql:8.0
+    ports: ["127.0.0.1:13307:3306"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    command: ["--performance-schema=OFF", "--ssl=OFF"]
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      # Without TLS, caching_sha2_password needs the server's public key on a first login.
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 --get-server-public-key -udbtop -pdbtop -e 'select 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+
+  # Older than 16: no EXPLAIN (GENERIC_PLAN), and pg_stat_statements still has total_time.
+  # No TLS here either.
+  postgres13:
+    profiles: ["extra"]
+    image: postgres:13
+    ports: ["127.0.0.1:15433:5432"]
+    environment:
+      POSTGRES_PASSWORD: root
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    volumes:
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=dbtop psql -h 127.0.0.1 -U dbtop -d shop -c 'select 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60

@@ -1,0 +1,16 @@
+[package]
+name = "dbtop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+mysql = { version = "28.0.3", default-features = false, features = ["minimal-rust", "buffer-pool", "rustls-tls-ring"] }
+postgres = "0.19.14"
+ratatui = "0.30.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring"] }
+toml = "1.1.6"
+unicode-width = "0.2.2"
+webpki-roots = "1.0.9"
