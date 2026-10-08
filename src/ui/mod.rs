@@ -1,4 +1,7 @@
 mod graph;
+pub(crate) mod metrics;
+mod plan_tree;
+mod sql;
 mod text;
 mod theme;
 
@@ -7,14 +10,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Detail, PlanState, Subject, Tab};
-use crate::model::{Plan, Sample};
+use crate::model::{Plan, PlanTable, PlanViews, Sample};
 use graph::{BrailleGraph, axis_max, visible};
-use text::{fmt_count, fmt_ms, fmt_secs, one_line, wrap, wrap_words};
+use metrics::{Spec, spec};
+use sql::highlight;
+use text::{fmt_count, fmt_ms, fmt_secs, one_line, printable, wrap_words};
 use theme::THEME;
 
 fn fg(color: Color) -> Style {
@@ -57,52 +62,223 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    let (cols, max_rows) = grid(area);
+    let slots = slots(app, cols * max_rows);
+    let rows = slots.len().div_ceil(cols).clamp(1, max_rows);
+    // The graphs are what one looks at first: about half the screen, the table gets the rest.
+    let top_height = match rows {
+        1 => (area.height * 2 / 5).clamp(8, 20),
+        2 => (area.height * 9 / 20).clamp(14, 30),
+        _ => (area.height / 2).clamp(21, 40),
+    };
     let [top, main, footer] = Layout::vertical([
-        Constraint::Length((area.height / 4).clamp(6, 12)),
+        Constraint::Length(top_height),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .areas(area);
-    let [qps, conn] =
-        Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(top);
 
-    draw_qps(f, app, qps);
-    draw_conn(f, app, conn);
+    draw_dashboard(f, app, top, &slots, cols);
     draw_table(f, app, main);
     draw_footer(f, app, footer);
     draw_detail(f, app, area);
 }
 
-fn draw_qps(f: &mut Frame, app: &App, area: Rect) {
-    let max = axis_max(&app.qps, area.width.saturating_sub(2), 10.0);
-    let now = app.qps.last().map_or("-".to_string(), |&q| fmt_count(q));
-    let label = app.sample.as_ref().map_or("qps", |s| s.rate_label);
-    let block = panel(tag(vec![
-        Span::styled(format!(" {label} "), fg(THEME.accent).bold()),
-        Span::styled(format!("{now}/s "), fg(THEME.text)),
-    ]))
-    .title_top(
-        Line::from(tag(vec![Span::styled(
-            format!(" max {} ", fmt_count(max)),
-            fg(THEME.dim),
-        )]))
-        .right_aligned(),
-    );
+/// Panels across and down for a terminal of this size. Each wants about 32 columns, and each row
+/// after the first only comes with a taller terminal, so that the table below keeps its room.
+fn grid(area: Rect) -> (usize, usize) {
+    let cols = usize::from(area.width / 32).clamp(2, 4);
+    let rows = match area.height {
+        60.. => 3,
+        40.. => 2,
+        _ => 1,
+    };
+    (cols, rows)
+}
+
+enum Slot<'a> {
+    Metric(&'a str),
+    /// Two metrics that tell one story, one above the other in a single panel.
+    Pair(&'a str, &'a str),
+    Connections,
+}
+
+/// What to draw, best first. The throughput chart leads and the connections panel comes second;
+/// whatever the backend reports after that fills the rest while there is room.
+fn slots(app: &App, capacity: usize) -> Vec<Slot<'_>> {
+    let mut keys: Vec<&str> = match &app.sample {
+        Some(sample) => sample
+            .metrics
+            .iter()
+            .map(|m| m.key)
+            .filter(|key| spec(key).is_some())
+            .collect(),
+        None => vec!["qps"],
+    };
+    let mut slots = Vec::new();
+    if !keys.is_empty() {
+        slots.push(Slot::Metric(keys.remove(0)));
+    }
+    slots.push(Slot::Connections);
+    // The oldest open transaction and the history list it lets pile up tell one story and flow
+    // alike: one panel for both leaves a place for another metric.
+    let paired = keys.contains(&"oldest_xact") && keys.contains(&"hll");
+    slots.extend(keys.into_iter().filter_map(|key| match key {
+        "oldest_xact" if paired => Some(Slot::Pair("oldest_xact", "hll")),
+        "hll" if paired => None,
+        key => Some(Slot::Metric(key)),
+    }));
+    slots.truncate(capacity);
+    slots
+}
+
+fn draw_dashboard(f: &mut Frame, app: &App, area: Rect, slots: &[Slot], cols: usize) {
+    let rows = slots.len().div_ceil(cols).max(1);
+    // Spread evenly over the rows: nine panels are 3 + 3 + 3, not 4 + 4 and a lone one stretched
+    // across the whole width.
+    let per_row = slots.len().div_ceil(rows).max(1);
+    let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+    for (row, row_area) in slots.chunks(per_row).zip(row_areas.iter()) {
+        // A short last row spreads out rather than leaving a hole.
+        let cells = Layout::horizontal(vec![Constraint::Ratio(1, row.len() as u32); row.len()])
+            .split(*row_area);
+        for (slot, cell) in row.iter().zip(cells.iter()) {
+            match slot {
+                Slot::Metric(key) => draw_metric(f, app, *cell, key),
+                Slot::Pair(upper, lower) => draw_pair(f, app, *cell, upper, lower),
+                Slot::Connections => draw_conn(f, app, *cell),
+            }
+        }
+    }
+}
+
+/// One metric's history, and how to caption its chart.
+struct Series<'a> {
+    spec: &'static Spec,
+    history: &'a [f64],
+}
+
+impl<'a> Series<'a> {
+    fn of(app: &'a App, key: &str) -> Option<Self> {
+        Some(Series {
+            spec: spec(key)?,
+            history: app.history.get(key).map_or(&[][..], Vec::as_slice),
+        })
+    }
+
+    /// The top of the y axis for a chart `width` cells wide.
+    fn max(&self, width: u16) -> f64 {
+        self.spec
+            .fixed_max
+            .unwrap_or_else(|| axis_max(self.history, width, self.spec.floor))
+    }
+
+    /// The title set into a border: the latest poll's number, coloured when it needs a look, or
+    /// a dash, since an older number would pass for current.
+    fn title(&self) -> Vec<Span<'static>> {
+        let (shown, tone) = match self.history.last().filter(|v| v.is_finite()) {
+            Some(&value) => (self.spec.format(value), self.spec.tone(value)),
+            None => ("-".to_string(), THEME.dim),
+        };
+        tag(vec![
+            Span::styled(format!(" {} ", self.spec.title), fg(THEME.accent).bold()),
+            Span::styled(format!("{shown} "), fg(tone)),
+        ])
+    }
+
+    /// The scale for the border's other end. It is a nicety: a narrow panel's title needs the room.
+    fn scale(&self, max: f64, panel_width: u16) -> Option<Line<'static>> {
+        (self.spec.fixed_max.is_none() && panel_width >= 40).then(|| {
+            Line::from(tag(vec![Span::styled(
+                format!(" max {} ", self.spec.format(max)),
+                fg(THEME.dim),
+            )]))
+            .right_aligned()
+        })
+    }
+
+    fn graph(&self, width: u16, max: f64) -> BrailleGraph<'a> {
+        BrailleGraph {
+            data: visible(self.history, width),
+            max,
+            gradient: self.spec.gradient(),
+        }
+    }
+}
+
+/// A chart with its latest value in the title, coloured when the value needs a look.
+fn draw_metric(f: &mut Frame, app: &App, area: Rect, key: &str) {
+    let Some(series) = Series::of(app, key) else {
+        return;
+    };
+    let max = series.max(area.width.saturating_sub(2));
+    let mut block = panel(series.title());
+    if let Some(scale) = series.scale(max, area.width) {
+        block = block.title_top(scale);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(
-        BrailleGraph {
-            data: visible(&app.qps, inner.width),
-            max,
-            gradient: THEME.cool,
-        },
-        inner,
-    );
+    f.render_widget(series.graph(inner.width, max), inner);
+}
+
+/// Two charts in one frame, one above the other, with a rule between them that carries the
+/// second one's title.
+fn draw_pair(f: &mut Frame, app: &App, area: Rect, upper: &str, lower: &str) {
+    let (Some(upper_series), Some(lower_series)) = (Series::of(app, upper), Series::of(app, lower))
+    else {
+        return;
+    };
+    // Three lines of chart each and the rule between them, inside the frame: 2 + 3 + 1 + 3.
+    if area.height < 9 {
+        draw_metric(f, app, area, upper);
+        return;
+    }
+    let width = area.width.saturating_sub(2);
+    let (upper_max, lower_max) = (upper_series.max(width), lower_series.max(width));
+    let mut frame = panel(upper_series.title());
+    if let Some(scale) = upper_series.scale(upper_max, area.width) {
+        frame = frame.title_top(scale);
+    }
+    let inner = frame.inner(area);
+    f.render_widget(frame, area);
+
+    let upper_height = (inner.height - 1) / 2;
+    let upper_area = Rect {
+        height: upper_height,
+        ..inner
+    };
+    let rule = Rect {
+        x: area.x,
+        y: inner.y + upper_height,
+        width: area.width,
+        height: 1,
+    };
+    let lower_area = Rect {
+        y: rule.y + 1,
+        height: inner.height - upper_height - 1,
+        ..inner
+    };
+
+    // The rule is joined to the frame's sides, and its title sits in it like the frame's own.
+    let mut set = BorderType::Rounded.to_border_set();
+    set.top_left = "├";
+    set.top_right = "┤";
+    let mut divider = Block::new()
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .border_set(set)
+        .border_style(fg(THEME.border))
+        .title_top(Line::from(lower_series.title()));
+    if let Some(scale) = lower_series.scale(lower_max, area.width) {
+        divider = divider.title_top(scale);
+    }
+    f.render_widget(divider, rule);
+    f.render_widget(upper_series.graph(inner.width, upper_max), upper_area);
+    f.render_widget(lower_series.graph(inner.width, lower_max), lower_area);
 }
 
 fn draw_conn(f: &mut Frame, app: &App, area: Rect) {
     let block = panel(tag(vec![Span::styled(
-        " connections ",
+        " Connections ",
         fg(THEME.accent).bold(),
     )]));
     let inner = block.inner(area);
@@ -120,7 +296,7 @@ fn draw_conn(f: &mut Frame, app: &App, area: Rect) {
     let max = f64::from(sample.max_connections);
     f.render_widget(
         Paragraph::new(gauge(
-            "conn",
+            "Conn",
             connected,
             max,
             format!("{}/{}", connected as u64, max as u64),
@@ -132,7 +308,7 @@ fn draw_conn(f: &mut Frame, app: &App, area: Rect) {
     // background threads, and dbtop's own session. So no "x/y" here, and the bar never overflows.
     f.render_widget(
         Paragraph::new(gauge(
-            "run",
+            "Run",
             running,
             connected.max(running).max(1.0),
             (running as u64).to_string(),
@@ -454,17 +630,11 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
             fg(THEME.warn),
         ));
     }
-    out.extend(wrap(sql, width).into_iter().map(|l| Line::styled(l, value)));
+    out.extend(highlight(sql, width));
 
     out.push(Line::raw(""));
     out.push(section("Plan", width));
-    // Plans keep their layout (a tree's indentation); sentences wrap at spaces.
-    let styled = |text: &str, style: Style| -> Vec<Line<'static>> {
-        wrap(text, width)
-            .into_iter()
-            .map(|l| Line::styled(l, style))
-            .collect()
-    };
+    // Sentences wrap at spaces; a plan keeps its layout.
     let prose = |text: &str, style: Style| -> Vec<Line<'static>> {
         wrap_words(text, width)
             .into_iter()
@@ -473,16 +643,153 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
     };
     match &detail.plan {
         PlanState::Loading => out.push(Line::styled("fetching plan…", label)),
-        PlanState::Ready(Plan::Text(text)) => out.extend(styled(text, value)),
-        PlanState::Ready(Plan::Estimated { text, why }) => {
+        PlanState::Ready(Plan::Text(views)) => out.extend(plan_lines(views, width)),
+        PlanState::Ready(Plan::Estimated { text: views, why }) => {
             out.extend(prose(&format!("estimated: {why}"), fg(THEME.warn)));
             out.push(Line::raw(""));
-            out.extend(styled(text, value));
+            out.extend(plan_lines(views, width));
         }
         PlanState::Ready(Plan::Unavailable(why)) => {
             out.extend(prose(&format!("not available: {why}"), fg(THEME.warn)));
         }
         PlanState::Failed(e) => out.extend(prose(&format!("EXPLAIN failed: {e}"), fg(THEME.crit))),
+    }
+    out
+}
+
+/// The plan in each form the server drew it. With two, each gets a heading.
+fn plan_lines(views: &PlanViews, width: usize) -> Vec<Line<'static>> {
+    let label = fg(THEME.dim);
+    let headed = views.tree.is_some() && views.table.is_some();
+    let mut out = Vec::new();
+    if let Some(tree) = &views.tree {
+        if headed {
+            out.push(Line::styled("tree", label));
+        }
+        out.extend(plan_tree::lines(tree, width));
+    }
+    if let Some(table) = &views.table {
+        if headed {
+            out.push(Line::raw(""));
+            out.push(Line::styled("table", label));
+        }
+        out.extend(table_lines(table, width));
+    }
+    out
+}
+
+/// The classic `EXPLAIN` table, boxed the way the `mysql` client draws it, and fitted to `width`.
+/// Columns that are NULL all the way down are the first to go; then the last one, which holds the
+/// longest text (`Extra`), wraps under itself; a table that still does not fit is shown a row at a
+/// time.
+fn table_lines(table: &PlanTable, width: usize) -> Vec<Line<'static>> {
+    // Each column also takes a border and a space either side of its text, and the box one more
+    // border at its left.
+    const AROUND: usize = 3;
+    const NARROWEST_LAST: usize = 12;
+    let (label, value, edge) = (fg(THEME.dim), fg(THEME.text), fg(THEME.border));
+
+    // The text came from the server: no control character may reach the terminal.
+    let clean = |text: &String| text.chars().map(printable).collect::<String>();
+    let table = PlanTable {
+        header: table.header.iter().map(clean).collect(),
+        rows: table
+            .rows
+            .iter()
+            .map(|row| row.iter().map(clean).collect())
+            .collect(),
+    };
+    let cell = |row: &Vec<String>, c: usize| row.get(c).cloned().unwrap_or_default();
+
+    let natural: Vec<usize> = (0..table.header.len())
+        .map(|c| {
+            (table.rows.iter().map(|row| cell(row, c).width()))
+                .chain([table.header[c].width()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let boxed = |cols: &[usize]| 1 + cols.iter().map(|&c| natural[c] + AROUND).sum::<usize>();
+
+    let mut cols: Vec<usize> = (0..table.header.len()).collect();
+    if boxed(&cols) > width {
+        cols.retain(|&c| table.rows.iter().any(|row| cell(row, c) != "NULL"));
+    }
+    let Some((&last, head)) = cols.split_last() else {
+        return Vec::new();
+    };
+    // The last column takes what the others leave.
+    let room = width.saturating_sub(boxed(head) + AROUND);
+    if room < natural[last].min(NARROWEST_LAST) {
+        return rows_one_at_a_time(&table, width);
+    }
+    let last_width = natural[last].min(room);
+    let widths: Vec<usize> = head
+        .iter()
+        .map(|&c| natural[c])
+        .chain([last_width])
+        .collect();
+
+    let rule = |left: &str, join: &str, right: &str| {
+        let bars: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        Line::styled(format!("{left}{}{right}", bars.join(join)), edge)
+    };
+    let line = |cells: Vec<String>, style: Style| {
+        let mut spans = vec![Span::styled("│", edge)];
+        for (text, &w) in cells.iter().zip(&widths) {
+            let pad = " ".repeat(w.saturating_sub(text.width()));
+            spans.push(Span::styled(format!(" {text}{pad} "), style));
+            spans.push(Span::styled("│", edge));
+        }
+        Line::from(spans)
+    };
+
+    let header_cells = head
+        .iter()
+        .chain([&last])
+        .map(|&c| table.header[c].clone())
+        .collect();
+    let mut out = vec![
+        rule("╭", "┬", "╮"),
+        line(header_cells, label),
+        rule("├", "┼", "┤"),
+    ];
+    for row in &table.rows {
+        let mut wrapped = wrap_words(&cell(row, last), last_width).into_iter();
+        let mut cells: Vec<String> = head.iter().map(|&c| cell(row, c)).collect();
+        cells.push(wrapped.next().unwrap_or_default());
+        out.push(line(cells, value));
+        for rest in wrapped {
+            let mut cells = vec![String::new(); head.len()];
+            cells.push(rest);
+            out.push(line(cells, value));
+        }
+    }
+    out.push(rule("╰", "┴", "╯"));
+    out
+}
+
+/// A block per row, a line for each column that says something: for a table too wide for the room.
+fn rows_one_at_a_time(table: &PlanTable, width: usize) -> Vec<Line<'static>> {
+    let (label, value) = (fg(THEME.dim), fg(THEME.text));
+    let key = table.header.iter().map(|h| h.width()).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for (n, row) in table.rows.iter().enumerate() {
+        if n > 0 {
+            out.push(Line::raw(""));
+        }
+        for (name, cell) in table.header.iter().zip(row).filter(|(_, c)| *c != "NULL") {
+            for (i, part) in wrap_words(cell, width.saturating_sub(key + 2))
+                .into_iter()
+                .enumerate()
+            {
+                let name = if i == 0 { name.as_str() } else { "" };
+                out.push(Line::from(vec![
+                    Span::styled(format!("{name:<key$}  "), label),
+                    Span::styled(part, value),
+                ]));
+            }
+        }
     }
     out
 }
@@ -545,19 +852,35 @@ mod tests {
     use super::*;
     use crate::backend::{Backend, fake::Fake};
     use crate::collector::{Msg, Req};
-    use crate::model::SlowQuery;
+    use crate::model::{Raw, Reading, Sample, SlowQuery};
 
     fn loaded() -> (App, Fake) {
         let mut fake = Fake::seeded(3);
         let mut app = App::new("test".into());
         for i in 0..40 {
             let sample = fake.poll().unwrap();
-            app.on_msg(Msg::Poll {
-                sample,
-                qps: Some(500.0 + 20.0 * f64::from(i)),
-            });
+            // Rates need real time to pass; give every chart a rising line instead.
+            let values = sample
+                .metrics
+                .iter()
+                .map(|m| {
+                    let value = if m.key == "hit" {
+                        99.0
+                    } else {
+                        100.0 + 20.0 * f64::from(i)
+                    };
+                    (m.key, Some(value))
+                })
+                .collect();
+            app.on_msg(Msg::Poll { sample, values });
         }
         (app, fake)
+    }
+
+    /// Sends `sample` with a number for each of its metrics.
+    fn send(app: &mut App, sample: Sample) {
+        let values = sample.metrics.iter().map(|m| (m.key, Some(50.0))).collect();
+        app.on_msg(Msg::Poll { sample, values });
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -577,8 +900,8 @@ mod tests {
         let (mut app, _) = loaded();
         let screen = screen(&mut app, 120, 40);
         for expected in [
-            "qps",
-            "connections",
+            "QPS",
+            "Connections",
             "1 running",
             "2 slow",
             "USER",
@@ -667,6 +990,271 @@ mod tests {
         }
     }
 
+    /// What a line says, without its styles.
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn explain_table() -> PlanTable {
+        let row = |cells: [&str; 8]| cells.map(String::from).to_vec();
+        PlanTable {
+            header: row([
+                "id",
+                "select_type",
+                "table",
+                "partitions",
+                "type",
+                "key",
+                "rows",
+                "Extra",
+            ]),
+            rows: vec![
+                row([
+                    "1",
+                    "SIMPLE",
+                    "orders",
+                    "NULL",
+                    "ALL",
+                    "NULL",
+                    "812300",
+                    "Using where; Using temporary; Using filesort",
+                ]),
+                row(["1", "SIMPLE", "c", "NULL", "eq_ref", "PRIMARY", "1", "NULL"]),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_sql_in_the_details_is_coloured_on_the_screen() {
+        let (mut app, _) = loaded();
+        press(&mut app, KeyCode::Enter);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let (x, y) = find(buffer, "SELECT DATE(").expect("the statement is shown");
+        assert_eq!(buffer[(x, y)].fg, THEME.keyword, "SELECT is a keyword");
+        assert_eq!(buffer[(x + 7, y)].fg, THEME.function, "DATE( is a call");
+        assert_eq!(
+            buffer[(x + 6, y)].fg,
+            THEME.text,
+            "the space between is plain"
+        );
+    }
+
+    #[test]
+    fn a_plan_in_two_forms_shows_both_under_a_heading_each() {
+        let both = PlanViews {
+            tree: Some("-> Table scan on orders".into()),
+            table: Some(explain_table()),
+        };
+        let lines = plain(&plan_lines(&both, 120));
+        let at = |text: &str| lines.iter().position(|l| l == text);
+        let (tree, table) = (at("tree").unwrap(), at("table").unwrap());
+        assert!(lines[tree + 1].starts_with("Table scan"), "{lines:?}");
+        assert!(
+            tree < table
+                && lines[table + 1].starts_with('╭')
+                && lines[table + 2].contains("select_type"),
+            "{lines:?}"
+        );
+
+        // With only one form there is nothing to tell apart: no heading.
+        let tree_only = plain(&plan_lines(&"-> Seq Scan".into(), 120));
+        assert_eq!(tree_only, ["Seq Scan"]);
+        let table_only = PlanViews {
+            tree: None,
+            table: Some(explain_table()),
+        };
+        let lines = plain(&plan_lines(&table_only, 120));
+        assert!(
+            lines[0].starts_with('╭') && !lines.contains(&"table".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_details_of_a_running_query_carry_its_tree_and_its_table() {
+        let (mut app, mut fake) = loaded();
+        let reqs = press(&mut app, KeyCode::Enter);
+        let Some(Req::Explain(target)) = reqs.try_recv().ok() else {
+            panic!("no plan requested");
+        };
+        app.on_msg(Msg::Plan {
+            key: target.key(),
+            result: Ok(fake.explain(&target).unwrap()),
+        });
+        let lines = plain(&detail_lines(app.detail.as_ref().unwrap(), 140));
+        for expected in ["tree", "table"] {
+            assert!(
+                lines.iter().any(|l| l == expected),
+                "no {expected:?} heading: {lines:?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("│ id") && l.contains("select_type")),
+            "{lines:?}"
+        );
+    }
+
+    /// Where the vertical rules of a boxed line are.
+    fn rules_in(line: &str) -> Vec<usize> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, '│' | '┬' | '┼' | '┴'))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn the_tree_in_the_details_is_drawn_with_branches_and_not_with_arrows() {
+        let (mut app, mut fake) = loaded();
+        let reqs = press(&mut app, KeyCode::Enter);
+        let Some(Req::Explain(target)) = reqs.try_recv().ok() else {
+            panic!("no plan requested");
+        };
+        app.on_msg(Msg::Plan {
+            key: target.key(),
+            result: Ok(fake.explain(&target).unwrap()),
+        });
+        let lines = plain(&detail_lines(app.detail.as_ref().unwrap(), 140));
+        let at = lines
+            .iter()
+            .position(|l| l == "tree")
+            .expect("a tree heading");
+        let tree: Vec<&String> = lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert!(tree.len() >= 3, "{lines:?}");
+        assert!(
+            tree.iter().all(|l| !l.contains("->")),
+            "no arrows: {tree:?}"
+        );
+        assert!(
+            tree.iter().skip(1).any(|l| l.contains("└─ ")),
+            "branches: {tree:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_that_fits_is_shown_whole_in_a_box() {
+        let lines = plain(&table_lines(&explain_table(), 120));
+        assert_eq!(
+            lines.len(),
+            6,
+            "top, header, rule, two rows, bottom: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with('╭') && lines[0].ends_with('╮'),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with('├') && lines[2].ends_with('┤'),
+            "{lines:?}"
+        );
+        assert!(
+            lines[5].starts_with('╰') && lines[5].ends_with('╯'),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("partitions") && lines[1].starts_with("│ id "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[3].contains("812300") && lines[4].contains("PRIMARY"),
+            "{lines:?}"
+        );
+
+        // A rectangle, with the columns one under the other all the way down.
+        let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
+        let columns = rules_in(&lines[1]);
+        for row in [&lines[3], &lines[4]] {
+            assert_eq!(rules_in(row), columns, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_too_wide_loses_the_columns_that_are_null_all_the_way_down_first() {
+        let lines = plain(&table_lines(&explain_table(), 110));
+        assert_eq!(lines.len(), 6, "still a line a row: {lines:?}");
+        assert!(!lines[1].contains("partitions"), "{lines:?}");
+        assert!(
+            lines[1].contains("select_type") && lines[1].contains("Extra"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|l| l.width() <= 110), "{lines:?}");
+    }
+
+    #[test]
+    fn then_the_last_column_wraps_under_itself() {
+        let lines = plain(&table_lines(&explain_table(), 80));
+        assert_eq!(lines.len(), 8, "Extra took three lines: {lines:?}");
+        let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
+        assert!(
+            widths.iter().all(|w| *w == 80),
+            "the box fills what it was given: {widths:?}"
+        );
+        // The lines under the first hold nothing but the rest of Extra.
+        let words = |line: &str| {
+            line.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        };
+        assert!(words(&lines[3]).ends_with("UsingwhereUsing"), "{lines:?}");
+        assert_eq!(words(&lines[4]), "temporaryUsing", "{lines:?}");
+        assert_eq!(words(&lines[5]), "filesort", "{lines:?}");
+        // The second row still has its own line, after the wrapped ones.
+        assert!(
+            lines[6].contains("eq_ref") && lines[6].contains("PRIMARY"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_a_plan_table_never_reach_the_screen() {
+        let mut table = explain_table();
+        table.rows[0][2] = "\x1b[31mevil".into();
+        table.header[0] = "i\x07d".into();
+        for width in [200, 80, 40] {
+            let text = plain(&table_lines(&table, width)).join("\n");
+            assert!(
+                !text.contains('\x1b') && !text.contains('\x07') && text.contains('\u{FFFD}'),
+                "{width}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_that_cannot_fit_at_all_is_shown_a_row_at_a_time() {
+        let lines = plain(&table_lines(&explain_table(), 40));
+        assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:?}");
+        let orders = lines
+            .iter()
+            .position(|l| l.starts_with("table") && l.contains("orders"));
+        assert!(orders.is_some(), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("partitions")),
+            "NULL fields are left out: {lines:?}"
+        );
+        assert!(
+            lines.contains(&String::new()),
+            "a blank line between rows: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("key") && l.contains("PRIMARY")),
+            "the second row is there: {lines:?}"
+        );
+    }
+
     #[test]
     fn unavailable_and_failed_plans_say_why() {
         let (mut app, _) = loaded();
@@ -737,7 +1325,7 @@ mod tests {
         ] {
             let mut sample = fake.poll().unwrap();
             sample.encrypted = encrypted;
-            app.on_msg(Msg::Poll { sample, qps: None });
+            send(&mut app, sample);
             let footer = last_line(&mut app);
             assert!(
                 footer.contains(shown) && !footer.contains(hidden),
@@ -752,7 +1340,7 @@ mod tests {
         let mut sample = fake.poll().unwrap();
         sample.running_note =
             Some("this role cannot see other roles' queries: grant pg_read_all_stats".into());
-        app.on_msg(Msg::Poll { sample, qps: None });
+        send(&mut app, sample);
 
         let screen = screen(&mut app, 120, 40);
         let lines: Vec<_> = screen.lines().collect();
@@ -857,7 +1445,7 @@ mod tests {
         let (mut app, mut fake) = loaded();
         let mut sample = fake.poll().unwrap();
         sample.slow = vec![bare_digest()];
-        app.on_msg(Msg::Poll { sample, qps: None });
+        send(&mut app, sample);
 
         press(&mut app, KeyCode::Char('2'));
         let table = screen(&mut app, 120, 40);
@@ -883,26 +1471,282 @@ mod tests {
         let mut sample = fake.poll().unwrap();
         sample.slow.clear();
         sample.slow_note = Some("performance_schema is OFF on this server".into());
-        app.on_msg(Msg::Poll { sample, qps: None });
+        send(&mut app, sample);
 
         press(&mut app, KeyCode::Char('2'));
         assert!(screen(&mut app, 120, 40).contains("performance_schema is OFF"));
     }
 
     #[test]
-    fn the_throughput_graph_is_named_after_what_it_counts() {
+    fn the_throughput_chart_is_named_after_what_is_counted() {
         let (mut app, mut fake) = loaded();
         let mut sample = fake.poll().unwrap();
-        sample.rate_label = "tps";
-        app.on_msg(Msg::Poll {
-            sample,
-            qps: Some(10.0),
-        });
+        sample.metrics = vec![Reading {
+            key: "tps",
+            raw: Raw::Counter(1),
+        }];
+        send(&mut app, sample);
         let screen = screen(&mut app, 120, 40);
         assert!(
-            screen.contains(" tps ") && !screen.contains(" qps "),
+            screen.contains(" TPS ") && !screen.contains(" QPS "),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn the_grid_follows_the_terminal() {
+        let cells = |width, height| grid(Rect::new(0, 0, width, height));
+        assert_eq!(
+            cells(80, 20),
+            (2, 1),
+            "the smallest terminal keeps the two basic panels"
+        );
+        assert_eq!(cells(100, 30), (3, 1), "a panel needs about 32 columns");
+        assert_eq!(cells(120, 30), (3, 1), "wider means more across");
+        assert_eq!(cells(120, 40), (3, 2), "taller means a second row");
+        assert_eq!(cells(160, 44), (4, 2));
+        assert_eq!(cells(160, 60), (4, 3), "and a third");
+        assert_eq!(cells(400, 100), (4, 3), "and no more than that");
+    }
+
+    #[test]
+    fn the_more_room_the_more_metrics_are_shown() {
+        let (mut app, _) = loaded();
+        let names = [
+            "QPS",
+            "Connections",
+            "Slow",
+            "Buffer Pool Hit",
+            "Lock Waits",
+            "Deadlocks",
+            "Oldest Xact",
+            "History List",
+            "Net",
+            "Tmp Disk",
+        ];
+        let shown = |app: &mut App, width, height| {
+            let screen = screen(app, width, height);
+            // Only the dashboard: "slow" is also the name of a tab of the table below it.
+            let dashboard: String = screen
+                .lines()
+                .take_while(|l| !l.contains("1 running"))
+                .collect();
+            names
+                .iter()
+                .filter(|name| dashboard.contains(&format!(" {name} ")))
+                .count()
+        };
+        assert_eq!(shown(&mut app, 80, 24), 2, "QPS and Connections");
+        assert_eq!(shown(&mut app, 120, 30), 3, "one row of three");
+        assert_eq!(shown(&mut app, 120, 40), 6, "two rows of three");
+        assert_eq!(
+            shown(&mut app, 160, 44),
+            9,
+            "two rows of four, one of the eight holding two metrics, which leaves room for net"
+        );
+        assert_eq!(
+            shown(&mut app, 160, 60),
+            10,
+            "three rows of four hold everything the demo reports"
+        );
+    }
+
+    /// What `slots` decided, spelled out.
+    fn plan(app: &App, capacity: usize) -> Vec<String> {
+        slots(app, capacity)
+            .iter()
+            .map(|slot| match slot {
+                Slot::Metric(key) => key.to_string(),
+                Slot::Pair(upper, lower) => format!("{upper}+{lower}"),
+                Slot::Connections => "connections".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_oldest_transaction_and_the_history_list_share_a_panel_when_both_exist() {
+        let (mut app, mut fake) = loaded();
+        assert_eq!(
+            plan(&app, 12),
+            [
+                "qps",
+                "connections",
+                "slow",
+                "hit",
+                "lock_waits",
+                "deadlocks",
+                "oldest_xact+hll",
+                "net",
+                "tmp_disk"
+            ]
+        );
+
+        // Postgres has no history list: the age keeps a panel to itself.
+        let mut sample = fake.poll().unwrap();
+        sample.metrics.retain(|m| m.key != "hll");
+        send(&mut app, sample);
+        let alone = plan(&app, 12);
+        assert!(alone.contains(&"oldest_xact".to_string()), "{alone:?}");
+        assert!(!alone.iter().any(|slot| slot.contains('+')), "{alone:?}");
+    }
+
+    #[test]
+    fn a_pair_is_two_charts_in_one_frame_with_the_second_title_on_a_rule() {
+        let (mut app, _) = loaded();
+        let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let (x, top) = find(buffer, "╭┤ Oldest Xact").expect("the upper title");
+        let (rule_x, rule) = find(buffer, "├┤ History List")
+            .expect("the lower title sits on a rule joined to the frame");
+        assert_eq!(rule_x, x, "the rule starts at the frame's own left edge");
+        assert!(rule >= top + 4, "charts sit above the rule: {top} {rule}");
+        let closes = (rule + 1..buffer.area.height).find(|&y| buffer[(x, y)].symbol() == "╰");
+        assert!(
+            closes.is_some_and(|y| y >= rule + 4),
+            "the frame closes below the lower chart: {closes:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_last_row_is_balanced_not_a_lone_panel_stretched_across() {
+        let (mut app, _) = loaded();
+        // The demo has nine panels, which four across would leave as 4 + 4 + 1.
+        let screen = screen(&mut app, 160, 64);
+        let last = screen
+            .lines()
+            .find(|l| l.contains(" Tmp Disk "))
+            .expect("the last panel is drawn");
+        assert_eq!(last.matches('╭').count(), 3, "three rows of three: {last}");
+    }
+
+    #[test]
+    fn a_pair_too_short_for_two_charts_keeps_the_upper_one() {
+        let (app, _) = loaded();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_pair(f, &app, f.area(), "oldest_xact", "hll"))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains(" Oldest Xact ") && !screen.contains(" History List "),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_longest_title_and_its_value_fit_the_narrowest_panel() {
+        let (mut app, _) = loaded();
+        // 128 columns make four panels of 32, the narrowest the grid ever draws.
+        let screen = screen(&mut app, 128, 44);
+        let edge = screen
+            .lines()
+            .find(|l| l.contains(" Buffer Pool Hit "))
+            .expect("the title is drawn");
+        let value = edge.split(" Buffer Pool Hit ").nth(1).unwrap();
+        assert!(
+            value.starts_with(|c: char| c.is_ascii_digit()) && value.contains('%'),
+            "the value was cut off: {edge}"
+        );
+    }
+
+    #[test]
+    fn the_graphs_take_about_half_the_screen_and_the_table_keeps_room_below() {
+        let (mut app, _) = loaded();
+        for (width, height) in [(80, 24), (100, 30), (120, 40), (160, 44), (160, 64)] {
+            let screen = screen(&mut app, width, height);
+            // The table's tabs sit on its top edge.
+            let table = screen
+                .lines()
+                .position(|l| l.contains("1 running"))
+                .unwrap();
+            let height = usize::from(height);
+            assert!(
+                (height * 35 / 100..=height * 55 / 100).contains(&table),
+                "{width}x{height}: the table starts on line {table}"
+            );
+            assert!(
+                height - table >= 14,
+                "{width}x{height}: the table has only {} lines",
+                height - table
+            );
+        }
+    }
+
+    /// Where `text` starts on the screen.
+    fn find(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<(u16, u16)> {
+        (0..buffer.area.height).find_map(|y| {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            row.find(text)
+                .map(|byte| (row[..byte].chars().count() as u16, y))
+        })
+    }
+
+    #[test]
+    fn a_value_sits_in_its_panels_title_and_is_coloured_by_how_bad_it_is() {
+        let (mut app, mut fake) = loaded();
+        let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        for (hit, colour) in [(99.2, THEME.text), (90.0, THEME.warn), (70.0, THEME.crit)] {
+            let sample = fake.poll().unwrap();
+            let values = sample
+                .metrics
+                .iter()
+                .map(|m| (m.key, Some(if m.key == "hit" { hit } else { 1.0 })))
+                .collect();
+            app.on_msg(Msg::Poll { sample, values });
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+            let shown = format!("{hit:.1}%");
+            let buffer = terminal.backend().buffer();
+            let (x, y) =
+                find(buffer, &shown).unwrap_or_else(|| panic!("{shown} is not on the screen"));
+            assert_eq!(buffer[(x, y)].fg, colour, "{shown}");
+            assert!(y <= 1 || y >= 6, "it is in a title on a panel's top edge");
+        }
+    }
+
+    #[test]
+    fn a_metric_with_no_number_yet_shows_a_dash_and_an_unknown_one_is_not_drawn() {
+        let (mut app, mut fake) = loaded();
+        let mut sample = fake.poll().unwrap();
+        sample.metrics.push(Reading {
+            key: "mystery",
+            raw: Raw::Gauge(1.0),
+        });
+        let values = sample.metrics.iter().map(|m| (m.key, None)).collect();
+        app.on_msg(Msg::Poll { sample, values });
+
+        let screen = screen(&mut app, 160, 44);
+        assert!(
+            screen.contains(" QPS -") && screen.contains(" Buffer Pool Hit -"),
+            "{screen}"
+        );
+        assert!(!screen.contains("mystery"));
+    }
+
+    #[test]
+    fn before_the_first_poll_the_two_basic_panels_are_there() {
+        let mut app = App::new("test".into());
+        let screen = screen(&mut app, 160, 44);
+        assert!(
+            screen.contains(" QPS ") && screen.contains(" Connections "),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn everything_the_demo_reports_can_be_drawn() {
+        let mut fake = Fake::seeded(1);
+        for reading in fake.poll().unwrap().metrics {
+            assert!(
+                metrics::spec(reading.key).is_some(),
+                "{} has no spec",
+                reading.key
+            );
+        }
     }
 
     #[test]
@@ -914,7 +1758,7 @@ mod tests {
         cut.truncated = true;
         cut.secs = 5000.0; // sorts to the top
         sample.running.push(cut);
-        app.on_msg(Msg::Poll { sample, qps: None });
+        send(&mut app, sample);
 
         // The cursor keeps following the row it was on, so go to the top explicitly.
         press(&mut app, KeyCode::Char('g'));

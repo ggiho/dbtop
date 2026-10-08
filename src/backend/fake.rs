@@ -1,12 +1,15 @@
 //! Generated data so the UI can be developed and demoed without a database.
 
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
 use super::Backend;
-use crate::model::{ExplainTarget, Plan, RunningQuery, Sample, SlowQuery};
+use crate::model::{
+    ExplainTarget, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample, SlowQuery,
+};
 
 struct Template {
     user: &'static str,
@@ -21,74 +24,153 @@ struct Template {
     no_index: bool,
     /// Waiting on a row lock held by another thread.
     blocked: bool,
-    plan: &'static str,
+    plan: DemoPlan,
+}
+
+/// A plan as MySQL would draw it two ways: the tree, and the rows of the classic table (`|` between
+/// cells) under the columns every such table has.
+struct DemoPlan {
+    tree: &'static str,
+    table: &'static str,
+}
+
+const EXPLAIN_COLUMNS: [&str; 12] = [
+    "id",
+    "select_type",
+    "table",
+    "partitions",
+    "type",
+    "possible_keys",
+    "key",
+    "key_len",
+    "ref",
+    "rows",
+    "filtered",
+    "Extra",
+];
+
+/// For the template whose text is cut: it is never explained.
+const NO_PLAN: DemoPlan = DemoPlan {
+    tree: "",
+    table: "",
+};
+
+impl DemoPlan {
+    fn views(&self) -> PlanViews {
+        PlanViews {
+            tree: Some(self.tree.to_string()),
+            table: Some(PlanTable {
+                header: EXPLAIN_COLUMNS.map(String::from).to_vec(),
+                rows: self
+                    .table
+                    .lines()
+                    .map(|row| row.split('|').map(String::from).collect())
+                    .collect(),
+            }),
+        }
+    }
 }
 
 /// The one template whose text is generated and cut like a server with a small
 /// `track_activity_query_size` would.
 const BIG_IN_LIST: usize = 4;
 
-const PLAN_ORDERS: &str = concat!(
-    "-> Limit: 50 row(s)  (cost=18432 rows=50)\n",
-    "    -> Nested loop inner join  (cost=18432 rows=81230)\n",
-    "        -> Sort: o.created_at DESC  (cost=8123 rows=81230)\n",
-    "            -> Filter: (o.status = 'PENDING')  (cost=8123 rows=81230)\n",
-    "                -> Table scan on o  (cost=8123 rows=812300)\n",
-    "        -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1)",
-);
+const PLAN_ORDERS: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Limit: 50 row(s)  (cost=18432 rows=50)\n",
+        "    -> Nested loop inner join  (cost=18432 rows=81230)\n",
+        "        -> Sort: o.created_at DESC  (cost=8123 rows=81230)\n",
+        "            -> Filter: (o.status = 'PENDING')  (cost=8123 rows=81230)\n",
+        "                -> Table scan on o  (cost=8123 rows=812300)\n",
+        "        -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1)",
+    ),
+    table: concat!(
+        "1|SIMPLE|o|NULL|ALL|idx_customer|NULL|NULL|NULL|812300|10.00|Using where; Using filesort\n",
+        "1|SIMPLE|c|NULL|eq_ref|PRIMARY|PRIMARY|8|orders.o.customer_id|1|100.00|NULL",
+    ),
+};
 
-const PLAN_INVENTORY: &str = concat!(
-    "-> Update inventory (immediate)\n",
-    "    -> Filter: (inventory.qty > 0)  (cost=0.35 rows=1)\n",
-    "        -> Index lookup on inventory using idx_sku (sku='A-1029')  (cost=0.35 rows=1)",
-);
+const PLAN_INVENTORY: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Update inventory (immediate)\n",
+        "    -> Filter: (inventory.qty > 0)  (cost=0.35 rows=1)\n",
+        "        -> Index lookup on inventory using idx_sku (sku='A-1029')  (cost=0.35 rows=1)",
+    ),
+    table: "1|UPDATE|inventory|NULL|range|idx_sku|idx_sku|66|const|1|100.00|Using where",
+};
 
-const PLAN_PAYMENTS: &str = concat!(
-    "-> Sort: d\n",
-    "    -> Table scan on <temporary>\n",
-    "        -> Aggregate using temporary table\n",
-    "            -> Filter: (payments.created_at >= TIMESTAMP'2026-01-01 00:00:00')  (cost=412390 rows=1648000)\n",
-    "                -> Table scan on payments  (cost=412390 rows=3296000)",
-);
+const PLAN_PAYMENTS: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Sort: d\n",
+        "    -> Table scan on <temporary>\n",
+        "        -> Aggregate using temporary table\n",
+        "            -> Filter: (payments.created_at >= TIMESTAMP'2026-01-01 00:00:00')  (cost=412390 rows=1648000)\n",
+        "                -> Table scan on payments  (cost=412390 rows=3296000)",
+    ),
+    table: "1|SIMPLE|payments|NULL|ALL|idx_created_at|NULL|NULL|NULL|3296000|50.00|Using where; Using temporary; Using filesort",
+};
 
-const PLAN_SETTLEMENT: &str = concat!(
-    "-> Filter: (sum(si.amount) > 1000000)\n",
-    "    -> Table scan on <temporary>\n",
-    "        -> Aggregate using temporary table\n",
-    "            -> Nested loop inner join  (cost=96211 rows=211800)\n",
-    "                -> Index range scan on si using idx_settled_at over ('2026-09-01' <= settled_at <= '2026-09-30 23:59:59'), with index condition: (si.status in ('DONE','PARTIAL'))  (cost=22144 rows=211800)\n",
-    "                -> Single-row index lookup on m using PRIMARY (merchant_id=si.merchant_id)  (cost=0.25 rows=1)",
-);
+const PLAN_SETTLEMENT: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Filter: (sum(si.amount) > 1000000)\n",
+        "    -> Table scan on <temporary>\n",
+        "        -> Aggregate using temporary table\n",
+        "            -> Nested loop inner join  (cost=96211 rows=211800)\n",
+        "                -> Index range scan on si using idx_settled_at over ('2026-09-01' <= settled_at <= '2026-09-30 23:59:59'), with index condition: (si.status in ('DONE','PARTIAL'))  (cost=22144 rows=211800)\n",
+        "                -> Single-row index lookup on m using PRIMARY (merchant_id=si.merchant_id)  (cost=0.25 rows=1)",
+    ),
+    table: concat!(
+        "1|SIMPLE|si|NULL|range|idx_settled_at|idx_settled_at|5|NULL|211800|100.00|Using index condition; Using temporary; Using filesort\n",
+        "1|SIMPLE|m|NULL|eq_ref|PRIMARY|PRIMARY|8|settlement.si.merchant_id|1|100.00|NULL",
+    ),
+};
 
-const PLAN_ACCOUNT_UPDATE: &str = concat!(
-    "-> Update accounts\n",
-    "    -> Rows fetched before update\n",
-    "        -> Single-row index lookup on accounts using PRIMARY (id=42)  (cost=0.35 rows=1)",
-);
+const PLAN_ACCOUNT_UPDATE: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Update accounts\n",
+        "    -> Rows fetched before update\n",
+        "        -> Single-row index lookup on accounts using PRIMARY (id=42)  (cost=0.35 rows=1)",
+    ),
+    table: "1|UPDATE|accounts|NULL|range|PRIMARY|PRIMARY|8|const|1|100.00|Using where",
+};
 
-const PLAN_AUDIT_COUNT: &str = concat!(
-    "-> Aggregate: count(0)\n",
-    "    -> Filter: (audit_log.user_id = 77)  (cost=540211 rows=538000)\n",
-    "        -> Table scan on audit_log  (cost=540211 rows=5380000)",
-);
+const PLAN_AUDIT_COUNT: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Aggregate: count(0)\n",
+        "    -> Filter: (audit_log.user_id = 77)  (cost=540211 rows=538000)\n",
+        "        -> Table scan on audit_log  (cost=540211 rows=5380000)",
+    ),
+    table: "1|SIMPLE|audit_log|NULL|ALL|NULL|NULL|NULL|NULL|5380000|10.00|Using where",
+};
 
-const PLAN_SESSION: &str = concat!(
-    "-> Limit: 1 row(s)\n",
-    "    -> Single-row index lookup on sessions using uk_token (token='f3a9c1d27b')  (cost=0.35 rows=1)",
-);
+const PLAN_SESSION: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Limit: 1 row(s)\n",
+        "    -> Single-row index lookup on sessions using uk_token (token='f3a9c1d27b')  (cost=0.35 rows=1)",
+    ),
+    table: "1|SIMPLE|sessions|NULL|const|uk_token|uk_token|130|const|1|100.00|NULL",
+};
 
-const PLAN_NOTIFICATIONS: &str = concat!(
-    "-> Sort: notifications.created_at DESC  (cost=1620 rows=1530)\n",
-    "    -> Filter: (notifications.read_at is null)  (cost=1620 rows=1530)\n",
-    "        -> Index lookup on notifications using idx_user (user_id=1042)  (cost=1620 rows=15300)",
-);
-const PLAN_EVENTS_COUNT: &str = concat!(
-    "-> Aggregate: count(0)\n",
-    "    -> Filter: ((events.type = 'login') and (events.created_at > TIMESTAMP'2026-10-01 00:00:00'))  (cost=244120 rows=121300)\n",
-    "        -> Table scan on events  (cost=244120 rows=2420000)",
-);
-const PLAN_AUDIT_INSERT: &str =
-    "-> Insert into audit_log\n    -> Table scan on <value row constructor>";
+const PLAN_NOTIFICATIONS: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Sort: notifications.created_at DESC  (cost=1620 rows=1530)\n",
+        "    -> Filter: (notifications.read_at is null)  (cost=1620 rows=1530)\n",
+        "        -> Index lookup on notifications using idx_user (user_id=1042)  (cost=1620 rows=15300)",
+    ),
+    table: "1|SIMPLE|notifications|NULL|ref|idx_user|idx_user|8|const|15300|10.00|Using where; Using filesort",
+};
+const PLAN_EVENTS_COUNT: DemoPlan = DemoPlan {
+    tree: concat!(
+        "-> Aggregate: count(0)\n",
+        "    -> Filter: ((events.type = 'login') and (events.created_at > TIMESTAMP'2026-10-01 00:00:00'))  (cost=244120 rows=121300)\n",
+        "        -> Table scan on events  (cost=244120 rows=2420000)",
+    ),
+    table: "1|SIMPLE|events|NULL|ALL|NULL|NULL|NULL|NULL|2420000|5.00|Using where",
+};
+const PLAN_AUDIT_INSERT: DemoPlan = DemoPlan {
+    tree: "-> Insert into audit_log\n    -> Table scan on <value row constructor>",
+    table: "1|INSERT|audit_log|NULL|ALL|NULL|NULL|NULL|NULL|NULL|NULL|NULL",
+};
 
 const TEMPLATES: &[Template] = &[
     Template {
@@ -158,7 +240,7 @@ const TEMPLATES: &[Template] = &[
         scan_rate: 9_000,
         no_index: false,
         blocked: false,
-        plan: "",
+        plan: NO_PLAN,
     },
     Template {
         user: "app_web",
@@ -206,7 +288,7 @@ struct SlowTemplate {
     max_ms: f64,
     rows_examined_avg: f64,
     no_index: bool,
-    plan: &'static str,
+    plan: DemoPlan,
 }
 
 const SLOW: &[SlowTemplate] = &[
@@ -323,6 +405,8 @@ pub struct Fake {
     start: Instant,
     last_poll: Instant,
     questions: u64,
+    /// Every other cumulative counter the demo reports, by metric key.
+    counters: HashMap<&'static str, f64>,
     next_id: u64,
     active: Vec<Active>,
 }
@@ -342,6 +426,7 @@ impl Fake {
             start: now,
             last_poll: now,
             questions: 0,
+            counters: HashMap::new(),
             next_id: 8_800,
             active: Vec::new(),
         };
@@ -411,6 +496,29 @@ impl Backend for Fake {
             qps *= 1.35;
         }
         self.questions += (qps * dt) as u64;
+        // The rest follow the same wave, each at its own scale.
+        let wave = qps / 900.0;
+        for (key, per_second) in [
+            ("slow", 0.4 * (t / 23.0).sin().max(0.0)),
+            // About one a minute, for a second.
+            (
+                "deadlocks",
+                if (t as u64).is_multiple_of(61) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            ("net", 900_000.0 * wave),
+            ("tmp_disk", 0.6 * wave),
+        ] {
+            *self.counters.entry(key).or_default() += per_second * dt;
+        }
+        // Reads served from memory: mostly, with a dip now and then.
+        let hit_rate = 0.995 - 0.06 * (t / 31.0).sin().max(0.0);
+        let requests = (50_000.0 * wave * dt) as u64;
+        *self.counters.entry("requests").or_default() += requests as f64;
+        *self.counters.entry("hits").or_default() += requests as f64 * hit_rate;
 
         self.active.retain(|a| now < a.started + a.lasts);
         if self.active.len() < 14 && self.rng.unit() < 0.45 {
@@ -441,7 +549,7 @@ impl Backend for Fake {
                     ),
                     (
                         "tmp_disk_tables".to_string(),
-                        if tpl.plan.contains("temporary") {
+                        if tpl.plan.tree.contains("temporary") {
                             "1"
                         } else {
                             "0"
@@ -490,11 +598,58 @@ impl Backend for Fake {
             })
             .collect();
 
+        let counter =
+            |key: &str| Raw::Counter(self.counters.get(key).copied().unwrap_or(0.0) as u64);
+        let metrics = vec![
+            Reading {
+                key: "qps",
+                raw: Raw::Counter(self.questions),
+            },
+            Reading {
+                key: "slow",
+                raw: counter("slow"),
+            },
+            Reading {
+                key: "hit",
+                raw: Raw::Share {
+                    part: self.counters.get("hits").copied().unwrap_or(0.0) as u64,
+                    total: self.counters.get("requests").copied().unwrap_or(0.0) as u64,
+                },
+            },
+            Reading {
+                key: "lock_waits",
+                raw: Raw::Gauge(
+                    running
+                        .iter()
+                        .filter(|q| q.details.iter().any(|(k, _)| k == "blocked_by"))
+                        .count() as f64,
+                ),
+            },
+            Reading {
+                key: "deadlocks",
+                raw: counter("deadlocks"),
+            },
+            Reading {
+                key: "oldest_xact",
+                raw: Raw::Gauge(running.iter().map(|q| q.secs).fold(0.0, f64::max)),
+            },
+            Reading {
+                key: "hll",
+                // Climbs while a long transaction holds the purge back, then falls when it ends.
+                raw: Raw::Gauge(200.0 + 40.0 * (t % 70.0) + 60.0 * (t / 5.0).sin().abs()),
+            },
+            Reading {
+                key: "net",
+                raw: counter("net"),
+            },
+            Reading {
+                key: "tmp_disk",
+                raw: counter("tmp_disk"),
+            },
+        ];
         Ok(Sample {
-            counter: self.questions,
-            rate_label: "qps",
-            // The extra one is this tool's own connection.
-            threads_running: running.len() as u32 + 1,
+            metrics,
+            threads_running: running.len() as u32,
             threads_connected: (120.0 + 40.0 * (t / 17.0).sin()) as u32 + running.len() as u32,
             max_connections: 500,
             running,
@@ -516,7 +671,7 @@ impl Backend for Fake {
                     )));
                 }
                 Ok(match self.active.iter().find(|a| a.id == query.id) {
-                    Some(a) => Plan::Text(TEMPLATES[a.tpl].plan.to_string()),
+                    Some(a) => Plan::Text(TEMPLATES[a.tpl].plan.views()),
                     None => Plan::Unavailable(
                         "the statement finished before its plan could be read".into(),
                     ),
@@ -524,7 +679,7 @@ impl Backend for Fake {
             }
             ExplainTarget::Digest(slow) => {
                 Ok(match (0..SLOW.len()).find(|&i| digest(i) == slow.digest) {
-                    Some(i) => Plan::Text(SLOW[i].plan.to_string()),
+                    Some(i) => Plan::Text(SLOW[i].plan.views()),
                     None => Plan::Unavailable("unknown digest".into()),
                 })
             }
@@ -565,7 +720,15 @@ mod tests {
         assert_eq!(digests.len(), SLOW.len());
         for slow in &sample.slow {
             match fake.explain(&ExplainTarget::Digest(slow.clone())).unwrap() {
-                Plan::Text(text) => assert!(text.starts_with("->"), "{text}"),
+                Plan::Text(views) => {
+                    assert!(views.tree_text().starts_with("->"), "{views:?}");
+                    let table = views.table.as_ref().expect("both forms");
+                    assert_eq!(table.header.len(), EXPLAIN_COLUMNS.len());
+                    assert!(
+                        table.rows.iter().all(|row| row.len() == table.header.len()),
+                        "every row has a cell per column: {table:?}"
+                    );
+                }
                 other => panic!("no plan for {}: {other:?}", slow.sample_sql),
             }
         }

@@ -16,8 +16,24 @@ pub fn fmt_ms(ms: f64) -> String {
     fmt_secs(ms / 1000.0)
 }
 
+pub fn fmt_bytes(n: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let (mut value, mut unit) = (n, 0);
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{value:.0} B"),
+        _ if value < 10.0 => format!("{value:.1} {}", UNITS[unit]),
+        _ => format!("{value:.0} {}", UNITS[unit]),
+    }
+}
+
 pub fn fmt_count(n: f64) -> String {
-    if n < 1_000.0 {
+    if n < 10.0 && n.fract() != 0.0 {
+        format!("{n:.1}")
+    } else if n < 1_000.0 {
         format!("{n:.0}")
     } else if n < 10_000.0 {
         format!("{:.1}k", n / 1_000.0)
@@ -30,7 +46,7 @@ pub fn fmt_count(n: f64) -> String {
 
 /// Query text comes from the database, so a control character in it must not reach the terminal.
 /// Whitespace controls become a plain space; anything else becomes U+FFFD.
-fn printable(c: char) -> char {
+pub(super) fn printable(c: char) -> char {
     match c {
         '\t' | '\n' | '\r' | '\x0b' | '\x0c' => ' ',
         c if c.is_control() => '\u{FFFD}',
@@ -104,6 +120,26 @@ mod tests {
         assert_eq!(fmt_secs(65.0), "1m05s");
         assert_eq!(fmt_secs(3725.0), "1h02m");
         assert_eq!(fmt_ms(91_000.0), "1m31s");
+    }
+
+    #[test]
+    fn formats_byte_sizes() {
+        assert_eq!(fmt_bytes(0.0), "0 B");
+        assert_eq!(fmt_bytes(1023.0), "1023 B");
+        assert_eq!(fmt_bytes(1536.0), "1.5 KB");
+        assert_eq!(fmt_bytes(10.0 * 1024.0 * 1024.0), "10 MB");
+        assert_eq!(
+            fmt_bytes(5e15),
+            "4547 TB",
+            "the largest unit keeps growing rather than overflowing"
+        );
+    }
+
+    #[test]
+    fn small_fractions_keep_a_decimal() {
+        assert_eq!(fmt_count(0.3), "0.3");
+        assert_eq!(fmt_count(7.0), "7");
+        assert_eq!(fmt_count(12.6), "13");
     }
 
     #[test]

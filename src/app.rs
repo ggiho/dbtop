@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
@@ -107,7 +108,9 @@ pub struct App {
     pub label: String,
     pub tab: Tab,
     pub sample: Option<Sample>,
-    pub qps: Vec<f64>,
+    /// What each chart shows, oldest first. A poll with no number for a metric still adds a
+    /// `NaN`, so that all the charts move in step.
+    pub history: HashMap<&'static str, Vec<f64>>,
     pub threads: Vec<f64>,
     pub running_sel: Selection,
     pub slow_sel: Selection,
@@ -138,7 +141,7 @@ impl App {
             label,
             tab: Tab::Running,
             sample: None,
-            qps: Vec::new(),
+            history: HashMap::new(),
             threads: Vec::new(),
             running_sel: Selection::default(),
             slow_sel: Selection::default(),
@@ -166,13 +169,20 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Poll { mut sample, qps } => {
+            Msg::Poll { mut sample, values } => {
                 sample.running.sort_by(|a, b| b.secs.total_cmp(&a.secs));
                 sample
                     .slow
                     .sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
-                if let Some(qps) = qps {
-                    push(&mut self.qps, qps);
+                // A metric that is no longer reported (qps once pg_stat_statements is gone) must not
+                // leave a frozen chart behind.
+                self.history
+                    .retain(|key, _| values.iter().any(|(k, _)| k == key));
+                for (key, value) in values {
+                    push(
+                        self.history.entry(key).or_default(),
+                        value.unwrap_or(f64::NAN),
+                    );
                 }
                 push(&mut self.threads, f64::from(sample.threads_running));
                 self.running_sel.sync(&running_keys(&sample));
@@ -335,10 +345,9 @@ mod tests {
         }
     }
 
-    fn poll(app: &mut App, running: Vec<RunningQuery>) {
-        let sample = Sample {
-            counter: 0,
-            rate_label: "qps",
+    fn sample_with(running: Vec<RunningQuery>) -> Sample {
+        Sample {
+            metrics: vec![],
             threads_running: 1,
             threads_connected: 1,
             max_connections: 10,
@@ -347,8 +356,14 @@ mod tests {
             encrypted: None,
             slow: vec![slow("aaa", 5.0), slow("bbb", 9.0)],
             slow_note: None,
-        };
-        app.on_msg(Msg::Poll { sample, qps: None });
+        }
+    }
+
+    fn poll(app: &mut App, running: Vec<RunningQuery>) {
+        app.on_msg(Msg::Poll {
+            sample: sample_with(running),
+            values: vec![],
+        });
     }
 
     fn selected_id(app: &App) -> u64 {
@@ -378,6 +393,37 @@ mod tests {
                 .unwrap()
                 .contains("monitoring thread stopped")
         );
+    }
+
+    fn poll_with(app: &mut App, values: Vec<(&'static str, Option<f64>)>) {
+        app.on_msg(Msg::Poll {
+            sample: sample_with(vec![]),
+            values,
+        });
+    }
+
+    #[test]
+    fn every_chart_gets_a_point_per_poll_so_they_stay_in_step() {
+        let mut app = App::new(String::new());
+        poll_with(&mut app, vec![("a", Some(1.0)), ("b", None)]);
+        poll_with(&mut app, vec![("a", Some(2.0)), ("b", Some(5.0))]);
+
+        let b = &app.history["b"];
+        assert_eq!(
+            b.len(),
+            2,
+            "one point per poll, even when there was no number"
+        );
+        assert!(b[0].is_nan() && b[1] == 5.0, "{b:?}");
+        assert_eq!(app.history["a"], [1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_metric_that_stops_being_reported_loses_its_chart() {
+        let mut app = App::new(String::new());
+        poll_with(&mut app, vec![("qps", Some(1.0))]);
+        poll_with(&mut app, vec![("tps", Some(2.0))]);
+        assert!(!app.history.contains_key("qps") && app.history.contains_key("tps"));
     }
 
     #[test]

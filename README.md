@@ -1,7 +1,8 @@
 # dbtop
 
-A terminal monitor for MySQL and Postgres: running queries, slow queries, and for any of them the
-full SQL, details and execution plan. Rust, [ratatui](https://ratatui.rs), braille graphs.
+A terminal monitor for MySQL and Postgres: load graphs, running queries, slow queries, and for any
+of the queries the full SQL, details and execution plan. Rust, [ratatui](https://ratatui.rs),
+braille graphs.
 
 ```
 cargo run -- --demo                 # generated data, no database needed
@@ -10,14 +11,59 @@ cargo run -- <connection>           # a connection from dbtop's own config
 cargo run -- --config FILE <name>   # only that config file
 ```
 
-Needs a terminal of at least 80x20.
+Needs a terminal of at least 80x20; a larger one shows more graphs.
 
 | Key | |
 |---|---|
 | `↑↓` `j k` `PgUp PgDn` `g G` | move |
 | `Tab` `1` `2` | running / slow |
-| `Enter` | details: full SQL, info, plan. `↑↓ g G` scroll, `Esc` closes |
+| `Enter` | details: full SQL (syntax-coloured), info, plan. `↑↓ g G` scroll, `Esc` closes |
 | `q` `Ctrl-C` | quit |
+
+## The graphs
+
+Along the top: the last couple of minutes of each number, with the latest value in the title.
+Values that need a look turn yellow and then red (`Buffer Pool Hit` below 95% / 85%, an open
+transaction older than a minute / ten, a history list over 100,000 / 1,000,000, any lock wait,
+deadlock or slow query). How many graphs fit depends on the
+terminal: about 32 columns each, up to four across, and a second and a third row from 40 and 60
+lines tall. They take 40 to 50% of the height and the table below gets the rest. The most useful
+come first, so a small terminal loses the least.
+
+| | MySQL | Postgres |
+|---|---|---|
+| `QPS` | `Questions` | statements run, from `pg_stat_statements`; without it `TPS` leads instead |
+| `Connections` | connected out of `max_connections`, and running | the same, from `pg_stat_activity` |
+| `Slow` | `Slow_queries` | |
+| `Buffer Pool Hit` | buffer pool reads served from memory | shared buffers: `blks_hit` out of `blks_hit + blks_read` |
+| `Lock Waits` | sessions waiting on a row lock | sessions waiting on a lock |
+| `Deadlocks` | `lock_deadlocks` | `pg_stat_database.deadlocks` |
+| `Oldest Xact` | age of the oldest open InnoDB transaction | age of the oldest open transaction |
+| `History List` | history list length (HLL), `trx_rseg_history_len` | |
+| `TPS` | | commits + rollbacks |
+| `Net` | `Bytes_received + Bytes_sent` | |
+| `Tmp Disk` / `Temp Files` | `Created_tmp_disk_tables` | `temp_bytes` |
+| `Idle in Xact` | | sessions idle in a transaction |
+
+On MySQL `Oldest Xact` and `History List` share one panel, one chart above the other. They
+usually move together: a snapshot held open lets the history pile up, so one place in the grid
+serves both. (They do part ways: a transaction that only writes ages without piling anything up.)
+Postgres has no history list, so its `Oldest Xact` has a panel of its own.
+
+Counters are rates over the interval between two polls. `Buffer Pool Hit` is the share over the
+last interval, not since the server started, and keeps its last value while nothing is read.
+`Oldest Xact` shows `-` when no transaction is open. MySQL has no status variable for deadlocks or
+the history list; both come from `information_schema.INNODB_METRICS` (the PROCESS privilege, which
+the process list needs anyway), and a server that has switched either counter off loses its graph. MySQL has no `TPS`: `Com_commit` counts `COMMIT`
+statements and not the implicit commits of autocommit, so it would read near zero for most
+applications. dbtop's own polling adds a few statements per second to `QPS`. The `Connections`
+panel counts running statements the way the Running tab does, so dbtop's own session and the
+server's background threads are not among them.
+
+The SQL in the details is coloured: keywords, function calls, strings, numbers, comments, quoted
+names and placeholders. It is a small lexer for MySQL and Postgres text, not a parser, so an odd
+statement may be coloured a little wrong but is never changed or cut. A statement over 64 KB is
+shown plain.
 
 ## The servers dbq knows
 
@@ -106,6 +152,19 @@ showing an empty list that looks like an idle server.
 Never `EXPLAIN ANALYZE` (it would run the statement). A plan is fetched only when you press
 `Enter`, and an estimate is always labelled as one.
 
+A MySQL plan is shown in both of its forms, under a heading each: the **tree**
+(`EXPLAIN FORMAT=TREE`) and the classic **table** (`EXPLAIN`: id, select_type, table, type, key,
+rows, Extra), boxed like the `mysql` client draws it. The table is fitted to the window: columns that are NULL in every row go first,
+then `Extra` wraps under itself, and a table that still does not fit is listed a row at a time.
+An UPDATE or DELETE that MySQL 8.0 cannot draw as a tree has only the table. Postgres has one
+form, the planner's text.
+
+The tree is not shown as the server wrote it: dbtop reads its indentation and draws the steps with
+branches (`├─ └─ │`), so it is plain which step feeds which, and a long step wraps under its own
+text. Full scans (`Table scan`, `Seq Scan`) are yellow, ways to find rows through an index are
+green, joins are blue, and the `(cost=… rows=…)` estimate is dim but for the row count. The same
+reader serves Postgres, whose lines under a step (`Filter:`, `Sort Key:`) stay under it, dim.
+
 - **MySQL, running query**: `EXPLAIN FOR CONNECTION` gives the plan actually in use, but MySQL
   asks for the privileges of the explained connection's owner as well (bug #95850), so a
   least-privilege account is refused. dbtop then plans the statement's *text* and says why.
@@ -124,10 +183,12 @@ Never `EXPLAIN ANALYZE` (it would run the statement). A plan is fetched only whe
 - Redshift is not supported.
 - Tested on MySQL 8.0 and Postgres 13 and 16 in containers, and on Aurora MySQL 8.0.42 and
   Aurora PostgreSQL 17.7 (a DEV and a test cluster): connecting with `prefer` and `verify`, the
-  running list and its details, plans (including a statement in another database), and the
-  explanations shown when `performance_schema` is off or `pg_stat_statements` is not installed.
+  running list and its details, plans (including a statement in another database), the graphs'
+  queries, and the explanations shown when `performance_schema` is off or `pg_stat_statements` is
+  not installed.
   Not tested: MySQL 5.7/8.4/9, MariaDB, Postgres 14/15, the slow list and lock waits on Aurora
-  (no digests were available there), and any PROD server.
+  (no digests were available there), the graphs of a busy Aurora server (those servers were
+  nearly idle), and any PROD server.
 - The slow list ranks statements by total time (`performance_schema` digests,
   `pg_stat_statements`); it does not read slow-log files, which RDS/Aurora don't expose.
 - With `performance_schema` off (the Aurora default) the running list still works, in whole

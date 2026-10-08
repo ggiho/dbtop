@@ -20,7 +20,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{Backend, guard};
 use crate::config::{Target, Tls};
-use crate::model::{ExplainTarget, Plan, RunningQuery, Sample, SlowQuery};
+use crate::model::{ExplainTarget, Plan, Raw, Reading, RunningQuery, Sample, SlowQuery};
 
 const MAX_DIGESTS: i64 = 100;
 
@@ -49,12 +49,76 @@ const RUNNING: &str = "\
     WHERE a.backend_type = 'client backend' AND a.state = 'active' AND a.pid <> pg_backend_pid() \
     ORDER BY a.query_start";
 
+/// Cluster-wide counters from pg_stat_database and what the client sessions are doing, in one
+/// round trip.
 const TOTALS: &str = "\
-    SELECT (SELECT COALESCE(sum(xact_commit + xact_rollback), 0)::bigint FROM pg_stat_database), \
-           (SELECT count(*) FROM pg_stat_activity \
-             WHERE backend_type = 'client backend' AND state = 'active' AND pid <> pg_backend_pid()), \
-           (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'), \
-           current_setting('max_connections')::int";
+    SELECT d.xacts, d.blks_hit, d.blks_read, d.deadlocks, d.temp_bytes, \
+           a.running, a.connected, a.idle_xact, a.lock_waits, a.oldest_xact, \
+           current_setting('max_connections')::int AS max_connections \
+    FROM (SELECT COALESCE(sum(xact_commit + xact_rollback), 0)::bigint AS xacts, \
+                 COALESCE(sum(blks_hit), 0)::bigint AS blks_hit, \
+                 COALESCE(sum(blks_read), 0)::bigint AS blks_read, \
+                 COALESCE(sum(deadlocks), 0)::bigint AS deadlocks, \
+                 COALESCE(sum(temp_bytes), 0)::bigint AS temp_bytes \
+          FROM pg_stat_database) d, \
+         (SELECT count(*) FILTER (WHERE state = 'active' AND pid <> pg_backend_pid()) AS running, \
+                 count(*) AS connected, \
+                 count(*) FILTER (WHERE state = 'idle in transaction') AS idle_xact, \
+                 count(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waits, \
+                 EXTRACT(EPOCH FROM now() - min(xact_start) \
+                         FILTER (WHERE pid <> pg_backend_pid()))::float8 AS oldest_xact \
+          FROM pg_stat_activity WHERE backend_type = 'client backend') a";
+
+/// What `TOTALS` returns that is charted.
+struct Totals {
+    xacts: u64,
+    blks_hit: u64,
+    blks_read: u64,
+    deadlocks: u64,
+    temp_bytes: u64,
+    idle_xact: u64,
+    lock_waits: u64,
+    /// Seconds since the oldest open transaction began; `None` when none is open.
+    oldest_xact: Option<f64>,
+}
+
+/// What to chart, most useful first. The throughput chart is statements per second where
+/// pg_stat_statements can count them, and transactions otherwise: core PostgreSQL counts only
+/// those.
+fn readings(t: &Totals, calls: Option<u64>) -> Vec<Reading> {
+    let counter = |key, value: u64| Reading {
+        key,
+        raw: Raw::Counter(value),
+    };
+    let gauge = |key, value: f64| Reading {
+        key,
+        raw: Raw::Gauge(value),
+    };
+    let mut metrics = vec![match calls {
+        Some(calls) => counter("qps", calls),
+        None => counter("tps", t.xacts),
+    }];
+    metrics.extend([
+        Reading {
+            key: "hit",
+            raw: Raw::Share {
+                part: t.blks_hit,
+                total: t.blks_hit + t.blks_read,
+            },
+        },
+        gauge("lock_waits", t.lock_waits as f64),
+        counter("deadlocks", t.deadlocks),
+        gauge("oldest_xact", t.oldest_xact.unwrap_or(f64::NAN)),
+    ]);
+    if calls.is_some() {
+        metrics.push(counter("tps", t.xacts));
+    }
+    metrics.extend([
+        gauge("idle_xact", t.idle_xact as f64),
+        counter("temp_bytes", t.temp_bytes),
+    ]);
+    metrics
+}
 
 pub struct Postgres {
     /// `None` after a failure; the next poll reconnects.
@@ -286,24 +350,26 @@ impl Session {
     }
 
     fn poll(&mut self) -> Result<Sample> {
-        let totals = self.client.query_one(TOTALS, &[])?;
-        let transactions: i64 = totals.try_get(0)?;
-        let running_threads: i64 = totals.try_get(1)?;
-        let connected: i64 = totals.try_get(2)?;
-        let max_connections: i32 = totals.try_get(3)?;
+        let row = self.client.query_one(TOTALS, &[])?;
+        let totals = Totals {
+            xacts: row.try_get::<_, i64>("xacts")? as u64,
+            blks_hit: row.try_get::<_, i64>("blks_hit")? as u64,
+            blks_read: row.try_get::<_, i64>("blks_read")? as u64,
+            deadlocks: row.try_get::<_, i64>("deadlocks")? as u64,
+            temp_bytes: row.try_get::<_, i64>("temp_bytes")? as u64,
+            idle_xact: row.try_get::<_, i64>("idle_xact")? as u64,
+            lock_waits: row.try_get::<_, i64>("lock_waits")? as u64,
+            oldest_xact: row.try_get("oldest_xact")?,
+        };
+        let running_threads: i64 = row.try_get("running")?;
+        let connected: i64 = row.try_get("connected")?;
+        let max_connections: i32 = row.try_get("max_connections")?;
 
         let running = self.running()?;
         let (slow, slow_note, calls) = self.statements();
-        // Statements per second where pg_stat_statements can count them; otherwise the closest
-        // thing core PostgreSQL has, transactions.
-        let (counter, rate_label) = match calls {
-            Some(calls) => (calls, "qps"),
-            None => (transactions as u64, "tps"),
-        };
 
         Ok(Sample {
-            counter,
-            rate_label,
+            metrics: readings(&totals, calls),
             threads_running: running_threads as u32,
             threads_connected: connected as u32,
             max_connections: max_connections as u32,
@@ -460,7 +526,7 @@ impl Session {
         };
         match lines {
             Ok(lines) => Ok(Plan::Estimated {
-                text: lines.join("\n"),
+                text: lines.join("\n").into(),
                 why: format!("{why}{how}"),
             }),
             Err(e) => explain_failed(e),
@@ -647,6 +713,92 @@ zEB83JY79HsjJdxHEep231BSqUL8cjp1aXRQnbqoEv4SUHub1RJZkc69x4Mt1dw1
         }
     }
 
+    fn totals() -> Totals {
+        Totals {
+            xacts: 500,
+            blks_hit: 9_900,
+            blks_read: 100,
+            deadlocks: 2,
+            temp_bytes: 2048,
+            idle_xact: 3,
+            lock_waits: 1,
+            oldest_xact: Some(42.0),
+        }
+    }
+
+    fn keys(readings: &[Reading]) -> Vec<&'static str> {
+        readings.iter().map(|r| r.key).collect()
+    }
+
+    #[test]
+    fn with_pg_stat_statements_the_throughput_is_statements_and_transactions_follow() {
+        let readings = readings(&totals(), Some(1234));
+        assert_eq!(
+            keys(&readings),
+            [
+                "qps",
+                "hit",
+                "lock_waits",
+                "deadlocks",
+                "oldest_xact",
+                "tps",
+                "idle_xact",
+                "temp_bytes"
+            ]
+        );
+        assert!(matches!(readings[0].raw, Raw::Counter(1234)));
+    }
+
+    #[test]
+    fn deadlocks_are_a_count_charted_as_a_rate() {
+        let readings = readings(&totals(), None);
+        let deadlocks = readings.iter().find(|r| r.key == "deadlocks").unwrap();
+        assert!(matches!(deadlocks.raw, Raw::Counter(2)));
+    }
+
+    #[test]
+    fn no_open_transaction_is_a_gauge_with_nothing_to_report() {
+        let none = Totals {
+            oldest_xact: None,
+            ..totals()
+        };
+        let readings = readings(&none, None);
+        let age = readings.iter().find(|r| r.key == "oldest_xact").unwrap();
+        assert!(matches!(age.raw, Raw::Gauge(g) if g.is_nan()));
+    }
+
+    #[test]
+    fn without_it_the_throughput_is_transactions_and_is_not_charted_twice() {
+        let readings = readings(&totals(), None);
+        assert_eq!(keys(&readings)[0], "tps");
+        assert_eq!(keys(&readings).iter().filter(|k| **k == "tps").count(), 1);
+        assert!(!keys(&readings).contains(&"qps"));
+        assert!(matches!(readings[0].raw, Raw::Counter(500)));
+    }
+
+    #[test]
+    fn the_hit_rate_is_hits_out_of_hits_and_reads() {
+        let readings = readings(&totals(), None);
+        let hit = readings.iter().find(|r| r.key == "hit").unwrap();
+        assert!(matches!(
+            hit.raw,
+            Raw::Share {
+                part: 9_900,
+                total: 10_000
+            }
+        ));
+    }
+
+    #[test]
+    fn every_key_has_a_place_on_the_screen() {
+        for key in keys(&readings(&totals(), Some(1))) {
+            assert!(
+                crate::ui::metrics::spec(key).is_some(),
+                "{key} has no title and unit"
+            );
+        }
+    }
+
     #[test]
     fn redshift_is_refused_by_name_and_postgres_is_not() {
         let redshift = "PostgreSQL 8.0.2 on i686-pc-linux-gnu, compiled by GCC gcc (GCC) 3.4.2, Redshift 1.0.123456";
@@ -786,7 +938,7 @@ mod live {
         );
         match mon.explain(&ExplainTarget::Running(q)).unwrap() {
             Plan::Estimated { text, why } => {
-                assert!(text.contains("Seq Scan on orders"), "{text}");
+                assert!(text.tree_text().contains("Seq Scan on orders"), "{text:?}");
                 assert!(why.contains("cannot show another session's plan"), "{why}");
             }
             other => panic!("PostgreSQL has no way to read the running plan, got {other:?}"),
@@ -845,7 +997,9 @@ mod live {
             other => panic!("{other:?}"),
         }
         match admin().explain(&ExplainTarget::Running(q)).unwrap() {
-            Plan::Estimated { text, .. } => assert!(text.contains("Update on orders"), "{text}"),
+            Plan::Estimated { text, .. } => {
+                assert!(text.tree_text().contains("Update on orders"), "{text:?}")
+            }
             other => panic!("{other:?}"),
         }
         holder.join().unwrap();
@@ -875,7 +1029,10 @@ mod live {
         match mon.explain(&ExplainTarget::Running(q)).unwrap() {
             Plan::Estimated { text, why } => {
                 assert!(why.contains("generic plan"), "{why}");
-                assert!(text.contains("orders") && text.contains("$1"), "{text}");
+                assert!(
+                    text.tree_text().contains("orders") && text.tree_text().contains("$1"),
+                    "{text:?}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -905,7 +1062,7 @@ mod live {
         );
         match mon.explain(&ExplainTarget::Digest(d)).unwrap() {
             Plan::Estimated { text, why } => {
-                assert!(text.contains("Seq Scan on orders"), "{text}");
+                assert!(text.tree_text().contains("Seq Scan on orders"), "{text:?}");
                 assert!(why.contains("normalized text"), "{why}");
             }
             other => panic!("{other:?}"),
@@ -913,7 +1070,7 @@ mod live {
 
         let sample = mon.poll().unwrap();
         assert_eq!(
-            sample.rate_label, "qps",
+            sample.metrics[0].key, "qps",
             "pg_stat_statements can count statements"
         );
         let leaked: Vec<_> = sample
@@ -1009,7 +1166,9 @@ mod live {
         assert_eq!(q.db, "postgres");
 
         match mon.explain(&ExplainTarget::Running(q)).unwrap() {
-            Plan::Estimated { text, .. } => assert!(text.contains("pg_class"), "{text}"),
+            Plan::Estimated { text, .. } => {
+                assert!(text.tree_text().contains("pg_class"), "{text:?}")
+            }
             other => panic!("{other:?}"),
         }
         job.join().unwrap();
@@ -1191,6 +1350,150 @@ mod live {
         }
     }
 
+    /// Polls twice with `activity` in between and returns what would be charted.
+    fn charted(
+        mon: &mut Postgres,
+        activity: impl FnOnce(),
+    ) -> std::collections::HashMap<&'static str, f64> {
+        let mut meters = crate::model::Meters::default();
+        meters.read(Instant::now(), &mon.poll().unwrap().metrics);
+        activity();
+        thread::sleep(Duration::from_millis(1100));
+        let readings = mon.poll().unwrap().metrics;
+        meters
+            .read(Instant::now(), &readings)
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn the_dashboard_metrics_are_real_numbers_that_react_to_activity() {
+        let mut mon = least();
+        let shown = charted(&mut mon, || {
+            // Not the shape of pg4's statement: both would be one entry in pg_stat_statements.
+            work("SELECT /* live-metrics */ count(*) FROM orders WHERE amount > 1.5 AND status = 'PAID'").join().unwrap();
+        });
+
+        for key in [
+            "qps",
+            "hit",
+            "lock_waits",
+            "deadlocks",
+            "tps",
+            "idle_xact",
+            "temp_bytes",
+        ] {
+            assert!(shown.contains_key(key), "{key} is missing from {shown:?}");
+            assert!(crate::ui::metrics::spec(key).is_some());
+        }
+        assert!(shown["qps"] > 0.0 && shown["tps"] > 0.0, "{shown:?}");
+        assert!((0.0..=100.0).contains(&shown["hit"]), "{}", shown["hit"]);
+        assert!(shown["deadlocks"] >= 0.0);
+        // Server-wide gauges: tests that run alongside may be holding locks, so only their shape.
+        for key in ["lock_waits", "idle_xact"] {
+            assert!(shown[key] >= 0.0, "{key}: {}", shown[key]);
+        }
+        // With no transaction open there is no age at all.
+        assert!(shown.get("oldest_xact").is_none_or(|age| *age >= 0.0));
+    }
+
+    /// Two transactions that each want the row the other holds: after `deadlock_timeout` (a
+    /// second) PostgreSQL gives up on one of them.
+    fn make_a_deadlock() {
+        let side = |first: u32, second: u32| {
+            thread::spawn(move || {
+                let mut client = app_client(PORT, "shop");
+                client
+                    .batch_execute(&format!(
+                        "BEGIN; UPDATE orders SET amount = amount WHERE id = {first} /* live-deadlock */"
+                    ))
+                    .unwrap();
+                thread::sleep(Duration::from_millis(600)); // both hold their first row by now
+                // One of the two is refused here, with a deadlock error; the other one goes on.
+                let _ = client.batch_execute(&format!(
+                    "UPDATE orders SET amount = amount WHERE id = {second} /* live-deadlock */"
+                ));
+                let _ = client.batch_execute("ROLLBACK");
+            })
+        };
+        let (a, b) = (side(70, 71), side(71, 70));
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn a_real_deadlock_is_counted() {
+        let deadlocks = |mon: &mut Postgres| {
+            mon.poll()
+                .unwrap()
+                .metrics
+                .iter()
+                .find_map(|m| match (m.key, m.raw) {
+                    ("deadlocks", Raw::Counter(count)) => Some(count),
+                    _ => None,
+                })
+        };
+        let mut mon = least();
+        let before = deadlocks(&mut mon).expect("pg_stat_database counts deadlocks");
+        make_a_deadlock();
+        // The statistics reach pg_stat_database a moment after the fact.
+        let after = wait_for(|| deadlocks(&mut mon).filter(|count| *count > before));
+        assert!(after > before);
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn a_lock_wait_an_open_transaction_and_an_idle_one_show_up_in_the_gauges() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut client = app_client(PORT, "shop");
+            client
+                .batch_execute(
+                    "BEGIN; UPDATE orders SET amount = amount WHERE id = 3 /* live-gauge-holder */",
+                )
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(5)); // idle in transaction, holding the row
+            client.batch_execute("ROLLBACK").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let waiter =
+            work("UPDATE orders SET amount = amount + 1 WHERE id = 3 /* live-gauge-waiter */");
+
+        let mut mon = least();
+        let seen = wait_for(|| {
+            let metrics = mon.poll().unwrap().metrics;
+            let gauge = |key: &str| {
+                metrics
+                    .iter()
+                    .find(|m| m.key == key)
+                    .and_then(|m| match m.raw {
+                        Raw::Gauge(v) => Some(v),
+                        _ => None,
+                    })
+            };
+            (gauge("lock_waits")? >= 1.0
+                && gauge("idle_xact")? >= 1.0
+                && gauge("oldest_xact")? >= 1.0)
+                .then(|| {
+                    (
+                        gauge("lock_waits"),
+                        gauge("idle_xact"),
+                        gauge("oldest_xact"),
+                    )
+                })
+        });
+        assert!(
+            seen.0.unwrap() >= 1.0 && seen.1.unwrap() >= 1.0 && seen.2.unwrap() >= 1.0,
+            "{seen:?}"
+        );
+        holder.join().unwrap();
+        waiter.join().unwrap();
+    }
+
     #[test]
     #[ignore = "needs dev/compose.yaml"]
     fn a_wrong_password_fails_before_anything_else() {
@@ -1215,7 +1518,10 @@ mod live {
                 .unwrap()
                 .contains("CREATE EXTENSION pg_stat_statements")
         );
-        assert_eq!(sample.rate_label, "tps");
+        assert_eq!(
+            sample.metrics[0].key, "tps",
+            "only transactions can be counted"
+        );
     }
 
     #[test]

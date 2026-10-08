@@ -32,6 +32,17 @@ pub struct Theme {
     pub cool: Gradient,
     /// For load: green when idle, red when saturated.
     pub heat: Gradient,
+    /// SQL text, in the same palette.
+    pub keyword: Color,
+    pub function: Color,
+    pub string: Color,
+    pub number: Color,
+    pub comment: Color,
+    /// A name set in quotes: `status`, "Order".
+    pub quoted: Color,
+    pub operator: Color,
+    /// A placeholder or a variable: ?, $1, @name.
+    pub param: Color,
 }
 
 pub const THEME: Theme = Theme {
@@ -44,6 +55,14 @@ pub const THEME: Theme = Theme {
     crit: Color::Rgb(0xe0, 0x6c, 0x75),
     cool: Gradient([(0x56, 0xb6, 0xc2), (0x61, 0xaf, 0xef), (0xc6, 0x78, 0xdd)]),
     heat: Gradient([(0x98, 0xc3, 0x79), (0xe5, 0xc0, 0x7b), (0xe0, 0x6c, 0x75)]),
+    keyword: Color::Rgb(0xc6, 0x78, 0xdd),
+    function: Color::Rgb(0x61, 0xaf, 0xef),
+    string: Color::Rgb(0x98, 0xc3, 0x79),
+    number: Color::Rgb(0xd1, 0x9a, 0x66),
+    comment: Color::Rgb(0x7f, 0x84, 0x8e),
+    quoted: Color::Rgb(0xe5, 0xc0, 0x7b),
+    operator: Color::Rgb(0x56, 0xb6, 0xc2),
+    param: Color::Rgb(0xe0, 0x6c, 0x75),
 };
 
 #[cfg(test)]

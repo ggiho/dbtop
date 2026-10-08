@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::backend::Backend;
-use crate::model::{ExplainTarget, Plan, PlanKey, Rate, Sample};
+use crate::model::{ExplainTarget, Meters, Plan, PlanKey, Sample};
 
 pub enum Req {
     Explain(ExplainTarget),
@@ -12,7 +12,8 @@ pub enum Req {
 pub enum Msg {
     Poll {
         sample: Sample,
-        qps: Option<f64>,
+        /// The numbers to chart, named as in `sample.metrics`; `None` where there is none yet.
+        values: Vec<(&'static str, Option<f64>)>,
     },
     PollFailed(String),
     Plan {
@@ -28,12 +29,12 @@ pub fn spawn(mut backend: Box<dyn Backend>, interval: Duration) -> (Receiver<Msg
     let (req_tx, req_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let mut qps = Rate::default();
+        let mut meters = Meters::default();
         loop {
             let msg = match backend.poll() {
                 Ok(sample) => {
-                    let qps = qps.update(Instant::now(), sample.counter);
-                    Msg::Poll { sample, qps }
+                    let values = meters.read(Instant::now(), &sample.metrics);
+                    Msg::Poll { sample, values }
                 }
                 Err(e) => Msg::PollFailed(format!("{e:#}")),
             };

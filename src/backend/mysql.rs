@@ -9,7 +9,9 @@ use mysql::{Conn, DriverError, OptsBuilder, Row, SslOpts, Value};
 
 use super::{Backend, guard};
 use crate::config::{Target, Tls};
-use crate::model::{ExplainTarget, Plan, RunningQuery, Sample, SlowQuery};
+use crate::model::{
+    ExplainTarget, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample, SlowQuery,
+};
 
 const MAX_DIGESTS: usize = 100;
 
@@ -18,11 +20,26 @@ const MAX_DIGESTS: usize = 100;
 const NOT_OURS: &str = "DIGEST_TEXT NOT LIKE 'SHOW %' \
     AND DIGEST_TEXT NOT LIKE '%performance_schema%' \
     AND DIGEST_TEXT NOT LIKE '%INNODB_TRX%' \
+    AND DIGEST_TEXT NOT LIKE '%INNODB_METRICS%' \
     AND DIGEST_TEXT NOT LIKE 'SELECT @@%' \
     AND DIGEST_TEXT NOT LIKE 'SELECT `CONNECTION_ID`%' \
     AND DIGEST_TEXT NOT LIKE 'SET SESSION %' \
     AND DIGEST_TEXT NOT LIKE 'EXPLAIN %' \
     AND DIGEST_TEXT NOT LIKE 'USE %'";
+
+/// The server counters and gauges read in one `SHOW GLOBAL STATUS`.
+const STATUS: [&str; 10] = [
+    "Questions",
+    "Threads_running",
+    "Threads_connected",
+    "Slow_queries",
+    "Innodb_buffer_pool_read_requests",
+    "Innodb_buffer_pool_reads",
+    "Innodb_row_lock_current_waits",
+    "Bytes_received",
+    "Bytes_sent",
+    "Created_tmp_disk_tables",
+];
 
 const PS_OFF: &str = "performance_schema is OFF on this server, so statement digests are not \
     collected. Turn it on (performance_schema=ON, needs a restart) to see slow queries here.";
@@ -134,19 +151,24 @@ impl Session {
     }
 
     fn poll(&mut self) -> Result<Sample> {
-        let status: Vec<(String, String)> = self.conn.query(
-            "SHOW GLOBAL STATUS WHERE Variable_name IN ('Questions', 'Threads_running', 'Threads_connected')",
-        )?;
-        let status = |name: &str| -> Result<u64> {
+        let names = STATUS.map(|name| format!("'{name}'")).join(", ");
+        let status: Vec<(String, String)> = self.conn.query(format!(
+            "SHOW GLOBAL STATUS WHERE Variable_name IN ({names})"
+        ))?;
+        let value = |name: &str| -> Option<u64> {
             status
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .and_then(|(_, v)| v.parse().ok())
-                .with_context(|| format!("SHOW GLOBAL STATUS has no {name}"))
         };
-        let counter = status("Questions")?;
-        let threads_running = status("Threads_running")? as u32;
-        let threads_connected = status("Threads_connected")? as u32;
+        let required = |name: &str| -> Result<u64> {
+            value(name).with_context(|| format!("SHOW GLOBAL STATUS has no {name}"))
+        };
+        // The statement asking is itself running: leave it out, as on the Postgres side.
+        let status_running = required("Threads_running")?.saturating_sub(1) as u32;
+        let threads_connected = required("Threads_connected")? as u32;
+        required("Questions")?;
+        let metrics = readings(value, &self.innodb());
         let max_connections = self
             .conn
             .query_first::<u32, _>("SELECT @@max_connections")?
@@ -162,11 +184,18 @@ impl Session {
             "this account sees only its own connection, so other users' queries are missing: grant PROCESS"
                 .to_string()
         });
+        // The Running tab's own count, so the two agree. The server's counter also holds background
+        // threads such as the event scheduler, so on a quiet server it never reads 0; it is what
+        // is left where the account cannot see the other sessions.
+        let threads_running = if running_note.is_none() {
+            running.len() as u32
+        } else {
+            status_running
+        };
         let (slow, slow_note) = self.digests();
 
         Ok(Sample {
-            counter,
-            rate_label: "qps",
+            metrics,
             threads_running,
             threads_connected,
             max_connections,
@@ -176,6 +205,48 @@ impl Session {
             slow,
             slow_note,
         })
+    }
+
+    /// What InnoDB says beyond the status counters. A part is `None` where the account may not
+    /// look or the server does not keep it, and its graph is then left out.
+    fn innodb(&mut self) -> Innodb {
+        let (deadlocks, history_list) = self.innodb_metrics();
+        Innodb {
+            oldest_transaction: self.oldest_transaction(),
+            deadlocks,
+            history_list,
+        }
+    }
+
+    /// `lock_deadlocks` and `trx_rseg_history_len`. MySQL has no status variable for either, and
+    /// keeps both in INNODB_METRICS, switched on unless someone switched them off.
+    fn innodb_metrics(&mut self) -> (Option<u64>, Option<u64>) {
+        let rows: Vec<(String, i64)> = self
+            .conn
+            .query(
+                "SELECT NAME, `COUNT` FROM information_schema.INNODB_METRICS \
+                 WHERE NAME IN ('lock_deadlocks', 'trx_rseg_history_len') AND STATUS = 'enabled'",
+            )
+            .unwrap_or_default();
+        let get = |name: &str| {
+            rows.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, count)| (*count).max(0) as u64)
+        };
+        (get("lock_deadlocks"), get("trx_rseg_history_len"))
+    }
+
+    /// How long the longest open transaction has been open, in seconds: the one that holds back
+    /// purging and keeps locks. NaN when none is open; `None` where the account may not look at
+    /// InnoDB's transactions.
+    fn oldest_transaction(&mut self) -> Option<f64> {
+        self.conn
+            .query_first::<Option<i64>, _>(
+                "SELECT MAX(TIMESTAMPDIFF(SECOND, trx_started, NOW())) FROM information_schema.INNODB_TRX",
+            )
+            .ok()
+            .flatten()
+            .map(|age| age.map_or(f64::NAN, |secs| secs.max(0) as f64))
     }
 
     /// Statements in flight. `SHOW FULL PROCESSLIST` works on every server, with or without
@@ -319,25 +390,40 @@ impl Session {
         }
     }
 
+    /// Whether `query` is still what its connection runs: a connection id outlives its statements.
+    fn standing(&mut self, query: &RunningQuery) -> Result<Standing> {
+        let now = self.processlist()?.0.into_iter().find(|q| q.id == query.id);
+        Ok(Standing::of(now.as_ref(), query))
+    }
+
     fn explain_running(&mut self, query: &RunningQuery) -> Result<Plan> {
-        // A connection id outlives its statements: make sure it still runs the one that was opened.
-        match self.processlist()?.0.into_iter().find(|q| q.id == query.id) {
-            None => {
+        match self.standing(query)? {
+            Standing::Finished => {
                 return Ok(Plan::Unavailable(
                     "the statement finished before its plan could be read".into(),
                 ));
             }
-            Some(now) if now.sql != query.sql => {
+            Standing::Other => {
                 return Ok(Plan::Unavailable(
                     "the connection has moved on to another statement".into(),
                 ));
             }
-            Some(_) => {}
+            Standing::Same => {}
         }
 
         // The plan the server is really using. Only an integer goes into this statement.
         let refused = match self.run_explain(&format!("FOR CONNECTION {}", query.id), false) {
-            Ok(Some(text)) => return Ok(Plan::Text(text)),
+            Ok(Some(views)) => {
+                // The tree and the table are two statements, one after the other: had the
+                // connection taken up another statement in between, one of them would describe it.
+                if self.standing(query)? == Standing::Other {
+                    return Ok(Plan::Unavailable(
+                        "the connection moved on to another statement while its plan was being read"
+                            .into(),
+                    ));
+                }
+                return Ok(Plan::Text(views));
+            }
             Ok(None) => {
                 return Ok(Plan::Unavailable(
                     "the connection is not executing a statement".into(),
@@ -391,7 +477,7 @@ impl Session {
                 .query_drop(format!("USE {}", quote_ident(schema)))?;
         }
         match self.run_explain(sql, true) {
-            Ok(Some(text)) => Ok(Plan::Estimated { text, why }),
+            Ok(Some(views)) => Ok(Plan::Estimated { text: views, why }),
             Ok(None) => Ok(Plan::Unavailable(format!(
                 "{why}; the server returned no plan"
             ))),
@@ -408,7 +494,11 @@ impl Session {
     /// Text goes through the prepared-statement protocol (`prepared`), which carries exactly one
     /// statement whatever the text contains. `FOR CONNECTION` is not allowed there (ERROR 1295),
     /// but it is built from an integer, so the plain protocol is safe for it.
-    fn run_explain(&mut self, target: &str, prepared: bool) -> mysql::Result<Option<String>> {
+    ///
+    /// The plan is asked for in both of MySQL's forms, the tree and the classic table. Either may
+    /// be missing: MySQL 8.0 cannot draw an UPDATE or DELETE as a tree, and says so in the result
+    /// instead of failing, and the tree needs 8.0.16.
+    fn run_explain(&mut self, target: &str, prepared: bool) -> mysql::Result<Option<PlanViews>> {
         let mut rows = |sql: String| -> mysql::Result<Vec<Row>> {
             if prepared {
                 self.conn.exec(sql, ())
@@ -416,22 +506,84 @@ impl Session {
                 self.conn.query(sql)
             }
         };
-        match rows(format!("EXPLAIN FORMAT=TREE {target}")) {
-            // MySQL 8.0 cannot draw some statements (UPDATE, DELETE) as a tree. It says so in the
-            // result instead of failing, so ask again in the classic tabular format.
-            Ok(found) => match tree_text(found) {
-                Some(text) if text.contains("<not executable by iterator executor>") => {
-                    Ok(table_text(rows(format!("EXPLAIN {target}"))?))
-                }
-                other => Ok(other),
-            },
-            // FORMAT=TREE needs MySQL 8.0.16.
-            Err(mysql::Error::MySqlError(e)) if e.code == 1064 => {
-                Ok(table_text(rows(format!("EXPLAIN {target}"))?))
-            }
-            Err(e) => Err(e),
-        }
+        let tree = match rows(format!("EXPLAIN FORMAT=TREE {target}")) {
+            Ok(found) => tree_text(found)
+                .filter(|text| !text.contains("<not executable by iterator executor>")),
+            Err(mysql::Error::MySqlError(e)) if e.code == 1064 => None,
+            Err(e) => return Err(e),
+        };
+        // Named, so that a server whose `explain_format` was changed still answers with the table.
+        let table = plan_table(rows(format!("EXPLAIN FORMAT=TRADITIONAL {target}"))?);
+        Ok((tree.is_some() || table.is_some()).then_some(PlanViews { tree, table }))
     }
+}
+
+/// What InnoDB reports outside `SHOW GLOBAL STATUS`.
+#[derive(Default)]
+struct Innodb {
+    /// Seconds the longest open transaction has been open; NaN when none is.
+    oldest_transaction: Option<f64>,
+    /// Deadlocks since the server began counting them.
+    deadlocks: Option<u64>,
+    /// History list length: undo records waiting to be purged.
+    history_list: Option<u64>,
+}
+
+/// What to chart, most useful first. A metric whose counters this server does not have (MariaDB,
+/// a managed variant) or its account may not read is left out rather than shown as zero.
+fn readings(value: impl Fn(&str) -> Option<u64>, innodb: &Innodb) -> Vec<Reading> {
+    let counter = |key, name: &str| {
+        value(name).map(|v| Reading {
+            key,
+            raw: Raw::Counter(v),
+        })
+    };
+    let sum = |key, names: &[&str]| {
+        let parts: Option<Vec<u64>> = names.iter().map(|name| value(name)).collect();
+        parts.map(|parts| Reading {
+            key,
+            raw: Raw::Counter(parts.iter().sum()),
+        })
+    };
+    // Reads that the buffer pool answered, out of all reads.
+    let hit = value("Innodb_buffer_pool_read_requests")
+        .zip(value("Innodb_buffer_pool_reads"))
+        .map(|(requests, from_disk)| Reading {
+            key: "hit",
+            raw: Raw::Share {
+                part: requests.saturating_sub(from_disk),
+                total: requests,
+            },
+        });
+    let gauge = |key, name: &str| {
+        value(name).map(|v| Reading {
+            key,
+            raw: Raw::Gauge(v as f64),
+        })
+    };
+    [
+        counter("qps", "Questions"),
+        counter("slow", "Slow_queries"),
+        hit,
+        gauge("lock_waits", "Innodb_row_lock_current_waits"),
+        innodb.deadlocks.map(|count| Reading {
+            key: "deadlocks",
+            raw: Raw::Counter(count),
+        }),
+        innodb.oldest_transaction.map(|secs| Reading {
+            key: "oldest_xact",
+            raw: Raw::Gauge(secs),
+        }),
+        innodb.history_list.map(|length| Reading {
+            key: "hll",
+            raw: Raw::Gauge(length as f64),
+        }),
+        sum("net", &["Bytes_received", "Bytes_sent"]),
+        counter("tmp_disk", "Created_tmp_disk_tables"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn connect(target: &Target, ssl: Option<SslOpts>) -> mysql::Result<Conn> {
@@ -545,19 +697,39 @@ fn tree_text(rows: Vec<Row>) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n").trim_end().to_string())
 }
 
-/// The classic tabular `EXPLAIN`, aligned like the `mysql` client prints it.
-fn table_text(rows: Vec<Row>) -> Option<String> {
+/// The classic tabular `EXPLAIN`: the screen lays it out, to fit the room it has.
+fn plan_table(rows: Vec<Row>) -> Option<PlanTable> {
     let header: Vec<String> = rows
         .first()?
         .columns_ref()
         .iter()
         .map(|c| c.name_str().into_owned())
         .collect();
-    let body: Vec<Vec<String>> = rows
+    let rows = rows
         .into_iter()
         .map(|row| row.unwrap().iter().map(cell).collect())
         .collect();
-    Some(format_table(&header, &body))
+    Some(PlanTable { header, rows })
+}
+
+/// What a connection is doing now, compared with the statement a user opened.
+#[derive(Debug, PartialEq)]
+enum Standing {
+    Same,
+    /// It runs nothing any more.
+    Finished,
+    /// It runs another statement.
+    Other,
+}
+
+impl Standing {
+    fn of(now: Option<&RunningQuery>, opened: &RunningQuery) -> Standing {
+        match now {
+            None => Standing::Finished,
+            Some(now) if now.sql != opened.sql => Standing::Other,
+            Some(_) => Standing::Same,
+        }
+    }
 }
 
 fn cell(value: &Value) -> String {
@@ -572,31 +744,6 @@ fn cell(value: &Value) -> String {
     }
 }
 
-fn format_table(header: &[String], body: &[Vec<String>]) -> String {
-    let widths: Vec<usize> = (0..header.len())
-        .map(|i| {
-            body.iter()
-                .map(|r| r[i].chars().count())
-                .chain([header[i].chars().count()])
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let line = |cells: &[String]| {
-        cells
-            .iter()
-            .zip(&widths)
-            .map(|(c, w)| format!("{c:<w$}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_string()
-    };
-    let mut out = vec![line(header)];
-    out.extend(body.iter().map(|r| line(r)));
-    out.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +754,171 @@ mod tests {
             tls_ca: ca.map(std::path::PathBuf::from),
             ..Target::dev(crate::config::Kind::Mysql, 3306, "u", "p")
         }
+    }
+
+    fn status(pairs: &[(&str, u64)]) -> impl Fn(&str) -> Option<u64> {
+        let map: HashMap<String, u64> = pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        move |name| map.get(name).copied()
+    }
+
+    fn keys(readings: &[Reading]) -> Vec<&'static str> {
+        readings.iter().map(|r| r.key).collect()
+    }
+
+    #[test]
+    fn every_status_variable_the_readings_read_is_asked_for() {
+        let read = std::cell::RefCell::new(Vec::<String>::new());
+        readings(
+            |name| {
+                read.borrow_mut().push(name.to_string());
+                Some(1)
+            },
+            &Innodb::default(),
+        );
+        let read = read.into_inner();
+        assert!(read.len() >= 8, "{read:?}");
+        for name in &read {
+            assert!(
+                STATUS.contains(&name.as_str()),
+                "{name} is read but never requested"
+            );
+        }
+    }
+
+    const ALL: [(&str, u64); 8] = [
+        ("Questions", 1000),
+        ("Slow_queries", 3),
+        ("Innodb_buffer_pool_read_requests", 10_000),
+        ("Innodb_buffer_pool_reads", 100),
+        ("Innodb_row_lock_current_waits", 2),
+        ("Bytes_received", 700),
+        ("Bytes_sent", 300),
+        ("Created_tmp_disk_tables", 1),
+    ];
+
+    /// Everything the account may read from InnoDB.
+    fn everything() -> Innodb {
+        Innodb {
+            oldest_transaction: Some(12.0),
+            deadlocks: Some(3),
+            history_list: Some(900),
+        }
+    }
+
+    #[test]
+    fn the_metrics_come_most_useful_first() {
+        assert_eq!(
+            keys(&readings(status(&ALL), &everything())),
+            [
+                "qps",
+                "slow",
+                "hit",
+                "lock_waits",
+                "deadlocks",
+                "oldest_xact",
+                "hll",
+                "net",
+                "tmp_disk"
+            ]
+        );
+    }
+
+    #[test]
+    fn deadlocks_are_counted_and_the_history_list_is_a_level() {
+        let readings = readings(status(&ALL), &everything());
+        let raw = |key: &str| readings.iter().find(|r| r.key == key).unwrap().raw;
+        assert!(
+            matches!(raw("deadlocks"), Raw::Counter(3)),
+            "charted as a rate"
+        );
+        assert!(
+            matches!(raw("hll"), Raw::Gauge(g) if g == 900.0),
+            "charted as it is"
+        );
+    }
+
+    #[test]
+    fn related_counters_are_added_up_and_the_hit_rate_is_a_share() {
+        let readings = readings(status(&ALL), &everything());
+        let raw = |key: &str| readings.iter().find(|r| r.key == key).unwrap().raw;
+        assert!(matches!(raw("net"), Raw::Counter(1000)));
+        assert!(matches!(
+            raw("hit"),
+            Raw::Share {
+                part: 9900,
+                total: 10_000
+            }
+        ));
+        assert!(matches!(raw("lock_waits"), Raw::Gauge(g) if g == 2.0));
+    }
+
+    #[test]
+    fn a_variable_the_server_lacks_drops_its_metric_instead_of_showing_zero() {
+        let without = |gone: &str| {
+            let rest: Vec<_> = ALL.iter().filter(|(k, _)| *k != gone).copied().collect();
+            keys(&readings(status(&rest), &everything()))
+        };
+        assert!(!without("Innodb_buffer_pool_reads").contains(&"hit"));
+        assert!(
+            !without("Bytes_sent").contains(&"net"),
+            "half a sum would be a wrong number"
+        );
+        assert!(
+            without("Slow_queries").contains(&"qps"),
+            "and the others are unaffected"
+        );
+        let blind = keys(&readings(status(&ALL), &Innodb::default()));
+        for key in ["oldest_xact", "deadlocks", "hll"] {
+            assert!(!blind.contains(&key), "{key}: no InnoDB access");
+        }
+    }
+
+    #[test]
+    fn more_disk_reads_than_requests_cannot_make_a_negative_share() {
+        let odd = [
+            ("Innodb_buffer_pool_read_requests", 5),
+            ("Innodb_buffer_pool_reads", 9),
+        ];
+        let readings = readings(status(&odd), &Innodb::default());
+        assert!(matches!(readings[0].raw, Raw::Share { part: 0, total: 5 }));
+    }
+
+    #[test]
+    fn every_key_has_a_place_on_the_screen() {
+        for key in keys(&readings(status(&ALL), &everything())) {
+            assert!(
+                crate::ui::metrics::spec(key).is_some(),
+                "{key} has no title and unit"
+            );
+        }
+    }
+
+    fn opened(sql: &str) -> RunningQuery {
+        RunningQuery {
+            id: 7,
+            user: String::new(),
+            host: String::new(),
+            db: String::new(),
+            state: String::new(),
+            secs: 0.0,
+            sql: sql.to_string(),
+            truncated: false,
+            details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_connection_is_judged_by_the_statement_it_runs_now() {
+        let query = opened("SELECT 1");
+        assert_eq!(
+            Standing::of(Some(&opened("SELECT 1")), &query),
+            Standing::Same
+        );
+        assert_eq!(
+            Standing::of(Some(&opened("SELECT 2")), &query),
+            Standing::Other
+        );
+        assert_eq!(Standing::of(None, &query), Standing::Finished);
     }
 
     #[test]
@@ -641,19 +953,6 @@ mod tests {
     fn identifiers_are_quoted_against_backticks() {
         assert_eq!(quote_ident("shop"), "`shop`");
         assert_eq!(quote_ident("we`ird"), "`we``ird`");
-    }
-
-    #[test]
-    fn tabular_explain_lines_up() {
-        let header = ["id", "table", "rows"].map(String::from).to_vec();
-        let body = vec![
-            ["1", "orders", "200000"].map(String::from).to_vec(),
-            ["1", "c", "NULL"].map(String::from).to_vec(),
-        ];
-        assert_eq!(
-            format_table(&header, &body),
-            "id  table   rows\n1   orders  200000\n1   c       NULL"
-        );
     }
 }
 
@@ -733,6 +1032,16 @@ mod live {
         })
     }
 
+    /// One cell of the classic table, by column name.
+    fn cell_of<'a>(table: &'a PlanTable, row: usize, column: &str) -> &'a str {
+        let at = table
+            .header
+            .iter()
+            .position(|h| h == column)
+            .unwrap_or_else(|| panic!("no column {column} in {:?}", table.header));
+        &table.rows[row][at]
+    }
+
     fn digest(mon: &mut MySql, needle: &str) -> SlowQuery {
         wait_for(|| {
             mon.poll()
@@ -748,6 +1057,25 @@ mod live {
             .query_first("SELECT COUNT(*) FROM shop.orders")
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn the_running_count_is_the_running_list_not_the_servers_thread_counter() {
+        // `Threads_running` also holds the asking statement and the event scheduler.
+        let job = work("SELECT /* live-running-count */ SLEEP(3) FROM shop.orders LIMIT 1");
+        let mut mon = least();
+        let sample = wait_for(|| {
+            let sample = mon.poll().unwrap();
+            sample
+                .running
+                .iter()
+                .any(|q| q.sql.contains("live-running-count"))
+                .then_some(sample)
+        });
+        assert!(sample.running_note.is_none());
+        assert_eq!(sample.threads_running as usize, sample.running.len());
+        job.join().unwrap();
     }
 
     #[test]
@@ -781,7 +1109,16 @@ mod live {
             q.details
         );
         match mon.explain(&ExplainTarget::Running(q)).unwrap() {
-            Plan::Text(text) => assert!(text.contains("Table scan on orders"), "{text}"),
+            Plan::Text(views) => {
+                assert!(
+                    views.tree_text().contains("Table scan on orders"),
+                    "{views:?}"
+                );
+                let table = views.table.expect("the classic table comes with the tree");
+                assert_eq!(cell_of(&table, 0, "table"), "orders", "{table:?}");
+                assert_eq!(cell_of(&table, 0, "type"), "ALL", "{table:?}");
+                assert_eq!(cell_of(&table, 0, "select_type"), "SIMPLE", "{table:?}");
+            }
             other => panic!("an admin account should get the real plan, got {other:?}"),
         }
         job.join().unwrap();
@@ -801,7 +1138,14 @@ mod live {
                     why.contains("FOR CONNECTION was refused") && why.contains("1045"),
                     "{why}"
                 );
-                assert!(text.contains("Table scan on orders"), "{text}");
+                assert!(
+                    text.tree_text().contains("Table scan on orders"),
+                    "{text:?}"
+                );
+                assert!(
+                    text.table.is_some(),
+                    "the estimate has both forms: {text:?}"
+                );
             }
             other => panic!("expected an estimate, got {other:?}"),
         }
@@ -854,12 +1198,15 @@ mod live {
 
         // An admin account gets the real plan of a running UPDATE...
         match mon.explain(&ExplainTarget::Running(q.clone())).unwrap() {
-            Plan::Text(text) => {
-                assert!(text.contains("UPDATE") && text.contains("orders"), "{text}");
+            Plan::Text(views) => {
+                // Some 8.0 servers cannot draw an UPDATE as a tree: then only the table is there.
                 assert!(
-                    !text.contains("not executable"),
-                    "the tree format can't draw UPDATE: {text}"
+                    !views.tree_text().contains("not executable"),
+                    "that is not a plan: {views:?}"
                 );
+                let table = views.table.expect("the classic table can draw an UPDATE");
+                assert_eq!(cell_of(&table, 0, "select_type"), "UPDATE", "{table:?}");
+                assert_eq!(cell_of(&table, 0, "table"), "orders", "{table:?}");
             }
             other => panic!("{other:?}"),
         }
@@ -893,14 +1240,18 @@ mod live {
 
         match mon.explain(&ExplainTarget::Digest(d)).unwrap() {
             Plan::Estimated { text, why } => {
-                assert!(text.contains("Table scan on orders"), "{text}");
+                assert!(
+                    text.tree_text().contains("Table scan on orders"),
+                    "{text:?}"
+                );
+                assert!(text.table.is_some(), "{text:?}");
                 assert!(why.contains("sample text"), "{why}");
             }
             other => panic!("{other:?}"),
         }
 
         // Everything dbtop itself sends, including the EXPLAIN just run above.
-        const OURS: [&str; 12] = [
+        const OURS: [&str; 13] = [
             "SHOW ",
             "SET SESSION",
             "SELECT @@",
@@ -909,6 +1260,7 @@ mod live {
             "SELECT trx_mysql_thread_id",
             "SELECT waiting.PROCESSLIST_ID",
             "SELECT SCHEMA_NAME, DIGEST",
+            "SELECT NAME, ",
             "EXPLAIN ",
             "USE ",
             "SELECT t.",
@@ -1217,6 +1569,157 @@ mod live {
         }
     }
 
+    /// Polls twice with `activity` in between and returns what would be charted.
+    fn charted(
+        mon: &mut MySql,
+        activity: impl FnOnce(),
+    ) -> std::collections::HashMap<&'static str, f64> {
+        let mut meters = crate::model::Meters::default();
+        let start = Instant::now();
+        meters.read(start, &mon.poll().unwrap().metrics);
+        activity();
+        thread::sleep(Duration::from_millis(1100));
+        let readings = mon.poll().unwrap().metrics;
+        meters
+            .read(Instant::now(), &readings)
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn the_dashboard_metrics_are_real_numbers_that_react_to_activity() {
+        let mut mon = least();
+        let shown = charted(&mut mon, || {
+            // A scan reads through the buffer pool, so the hit rate has something to be a share of.
+            // Not the shape of live4's statement: both would be one digest, whose sample text is
+            // whichever execution was slowest.
+            work("SELECT /* live-metrics */ COUNT(*) FROM shop.orders WHERE amount > 1.5 AND status = 'PAID'")
+                .join()
+                .unwrap();
+        });
+
+        for key in ["qps", "hit", "net", "lock_waits", "deadlocks", "hll"] {
+            assert!(shown.contains_key(key), "{key} is missing from {shown:?}");
+            assert!(crate::ui::metrics::spec(key).is_some());
+        }
+        assert!(shown["qps"] > 0.0, "{shown:?}");
+        assert!((0.0..=100.0).contains(&shown["hit"]), "{}", shown["hit"]);
+        assert!(shown["net"] > 0.0);
+        assert!(shown["deadlocks"] >= 0.0 && shown["hll"] >= 0.0);
+        // Server-wide gauges: tests that run alongside may be holding locks or a transaction open
+        // (without one there is no age at all), so only their shape.
+        assert!(shown["lock_waits"] >= 0.0);
+        assert!(shown.get("oldest_xact").is_none_or(|age| *age >= 0.0));
+    }
+
+    /// Two transactions that each want the row the other holds: InnoDB rolls one of them back.
+    fn make_a_deadlock() {
+        let side = |first: u32, second: u32| {
+            thread::spawn(move || {
+                let mut conn = app_conn(PORT);
+                conn.query_drop("BEGIN").unwrap();
+                conn.query_drop(format!(
+                    "UPDATE shop.orders SET amount = amount WHERE id = {first} /* live-deadlock */"
+                ))
+                .unwrap();
+                thread::sleep(Duration::from_millis(600)); // both hold their first row by now
+                // One of the two is refused here, with error 1213; the other one goes on.
+                let _ = conn.query_drop(format!(
+                    "UPDATE shop.orders SET amount = amount WHERE id = {second} /* live-deadlock */"
+                ));
+                let _ = conn.query_drop("ROLLBACK");
+            })
+        };
+        let (a, b) = (side(70, 71), side(71, 70));
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn a_real_deadlock_is_counted_and_charted_as_a_rate() {
+        let mut mon = least();
+        let shown = charted(&mut mon, make_a_deadlock);
+        let rate = shown.get("deadlocks").copied();
+        assert!(rate.is_some_and(|rate| rate > 0.0), "{shown:?}");
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn the_history_list_grows_while_an_old_snapshot_holds_back_the_purge() {
+        let history = |mon: &mut MySql| {
+            mon.poll()
+                .unwrap()
+                .metrics
+                .iter()
+                .find_map(|m| match (m.key, m.raw) {
+                    ("hll", Raw::Gauge(length)) => Some(length),
+                    _ => None,
+                })
+        };
+        let mut mon = least();
+        // Nothing changed after this snapshot can be purged while it is open.
+        let mut reader = app_conn(PORT);
+        reader
+            .query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            .unwrap();
+        let before = history(&mut mon).expect("the server keeps the history list length");
+
+        let mut writer = app_conn(PORT);
+        for i in 0..300 {
+            let sign = if i % 2 == 0 { "+" } else { "-" }; // ends where it began
+            writer
+                .query_drop(format!(
+                    "UPDATE shop.orders SET amount = amount {sign} 1 WHERE id = 72"
+                ))
+                .unwrap();
+        }
+        let after = wait_for(|| history(&mut mon).filter(|length| *length >= before + 250.0));
+        reader.query_drop("ROLLBACK").unwrap();
+        assert!(after >= before + 250.0, "{before} -> {after}");
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn a_lock_wait_and_an_old_transaction_show_up_in_the_gauges() {
+        let (id_tx, id_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut conn = app_conn(PORT);
+            conn.query_drop("BEGIN").unwrap();
+            conn.query_drop(
+                "UPDATE shop.orders SET amount = amount WHERE id = 3 /* live-gauge-holder */",
+            )
+            .unwrap();
+            id_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(5));
+            conn.query_drop("ROLLBACK").unwrap();
+        });
+        id_rx.recv().unwrap();
+        let waiter =
+            work("UPDATE shop.orders SET amount = amount + 1 WHERE id = 3 /* live-gauge-waiter */");
+
+        let mut mon = least();
+        let seen = wait_for(|| {
+            let metrics = mon.poll().unwrap().metrics;
+            let gauge = |key: &str| {
+                metrics
+                    .iter()
+                    .find(|m| m.key == key)
+                    .and_then(|m| match m.raw {
+                        Raw::Gauge(v) => Some(v),
+                        _ => None,
+                    })
+            };
+            (gauge("lock_waits")? >= 1.0 && gauge("oldest_xact")? >= 1.0)
+                .then(|| (gauge("lock_waits"), gauge("oldest_xact")))
+        });
+        assert!(seen.0.unwrap() >= 1.0 && seen.1.unwrap() >= 1.0, "{seen:?}");
+        holder.join().unwrap();
+        waiter.join().unwrap();
+    }
+
     #[test]
     #[ignore = "needs dev/compose.yaml"]
     fn a_wrong_password_fails_before_anything_else() {
@@ -1256,7 +1759,12 @@ mod live {
             q.details
         );
         match mon.explain(&ExplainTarget::Running(q)).unwrap() {
-            Plan::Text(text) => assert!(text.contains("Table scan on orders"), "{text}"),
+            Plan::Text(views) => {
+                assert!(
+                    views.tree_text().contains("Table scan on orders"),
+                    "{views:?}"
+                )
+            }
             other => panic!("{other:?}"),
         }
         job.join().unwrap();

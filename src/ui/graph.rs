@@ -30,7 +30,8 @@ impl Widget for BrailleGraph<'_> {
             let Some(v) = i.checked_sub(pad).map(|k| data[k]) else {
                 return 0;
             };
-            if v <= 0.0 {
+            // A NaN, a poll with no number, is a gap: no dots, as for zero.
+            if v.is_nan() || v <= 0.0 {
                 return 0;
             }
             // Any activity shows at least one dot.
@@ -154,6 +155,18 @@ mod tests {
     fn high_cells_are_hotter_than_low_ones() {
         let buf = render(&[8.0, 8.0], 8.0, 1, 2);
         assert_ne!(buf[(0, 0)].fg, buf[(0, 1)].fg);
+    }
+
+    #[test]
+    fn a_missing_point_is_a_gap_and_does_not_move_the_axis() {
+        let buf = render(&[4.0, f64::NAN, f64::NAN, 4.0], 4.0, 2, 1);
+        assert_eq!(
+            row(&buf, 0),
+            "⡇⢸",
+            "left column of the first cell, right column of the second"
+        );
+        assert_eq!(axis_max(&[f64::NAN, 3.0, f64::NAN], 10, 1.0), 5.0);
+        assert_eq!(axis_max(&[f64::NAN], 10, 4.0), 5.0, "only NaN: the floor");
     }
 
     #[test]
