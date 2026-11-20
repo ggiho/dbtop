@@ -10,7 +10,8 @@ use mysql::{Conn, DriverError, OptsBuilder, Row, SslOpts, Value};
 use super::{Backend, guard};
 use crate::config::{Target, Tls};
 use crate::model::{
-    ExplainTarget, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample, SlowQuery,
+    ExplainTarget, OpenTransaction, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample,
+    SlowQuery,
 };
 
 const MAX_DIGESTS: usize = 100;
@@ -174,10 +175,13 @@ impl Session {
             .query_first::<u32, _>("SELECT @@max_connections")?
             .unwrap_or(0);
 
-        let (mut running, visible) = self.processlist()?;
+        let rows = self.session_rows()?;
+        let owners = owners_of(&rows);
+        let (mut running, visible) = running_from(rows, self.id);
         if !running.is_empty() {
             self.enrich(&mut running);
         }
+        let (transactions, transactions_note) = self.transactions(&owners);
         // Without PROCESS the list holds only our own connection: the other users' queries are
         // missing without an error, which reads as an idle server.
         let running_note = (visible <= 1 && threads_connected >= 3).then(|| {
@@ -201,6 +205,8 @@ impl Session {
             max_connections,
             running,
             running_note,
+            transactions,
+            transactions_note,
             encrypted: Some(self.encrypted),
             slow,
             slow_note,
@@ -252,14 +258,103 @@ impl Session {
     /// Statements in flight. `SHOW FULL PROCESSLIST` works on every server, with or without
     /// performance_schema.
     fn processlist(&mut self) -> Result<(Vec<RunningQuery>, usize)> {
-        let rows: Vec<Row> = self.conn.query("SHOW FULL PROCESSLIST")?;
-        let visible = rows.len();
-        Ok((
-            rows.into_iter()
-                .filter_map(|row| process_from_row(row, self.id))
-                .collect(),
-            visible,
-        ))
+        let rows = self.session_rows()?;
+        Ok(running_from(rows, self.id))
+    }
+
+    /// Every session, sleeping ones included.
+    fn session_rows(&mut self) -> Result<Vec<Row>> {
+        Ok(self.conn.query("SHOW FULL PROCESSLIST")?)
+    }
+
+    /// Every open InnoDB transaction, oldest first, with the session that owns it. Unlike the
+    /// process list this holds sessions that are idle, which is where a transaction that locks
+    /// rows for nothing usually is.
+    fn transactions(
+        &mut self,
+        owners: &HashMap<u64, Owner>,
+    ) -> (Vec<OpenTransaction>, Option<String>) {
+        let found = self.conn.query::<TrxRow, _>(
+            "SELECT trx_mysql_thread_id, trx_state, TIMESTAMPDIFF(SECOND, trx_started, NOW()), \
+                    trx_rows_locked, trx_rows_modified, trx_query \
+             FROM information_schema.INNODB_TRX \
+             WHERE trx_mysql_thread_id <> CONNECTION_ID() \
+             ORDER BY trx_started LIMIT 200",
+        );
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Some(format!("cannot read InnoDB transactions: {e}")),
+                );
+            }
+        };
+
+        // What an idle session ran last is only in performance_schema.
+        let mut last: HashMap<u64, String> = HashMap::new();
+        if self.perf_schema && !found.is_empty() {
+            let ids = found
+                .iter()
+                .map(|row| row.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let statements = self.conn.query::<(u64, Option<String>), _>(format!(
+                "SELECT t.PROCESSLIST_ID, s.SQL_TEXT \
+                 FROM performance_schema.events_statements_current s \
+                 JOIN performance_schema.threads t ON t.THREAD_ID = s.THREAD_ID \
+                 WHERE t.PROCESSLIST_ID IN ({ids})"
+            ));
+            for (id, text) in statements.unwrap_or_default() {
+                last.extend(text.map(|text| (id, text)));
+            }
+        }
+        let waits = if found
+            .iter()
+            .any(|row| row.1.eq_ignore_ascii_case("LOCK WAIT"))
+        {
+            self.lock_waits()
+        } else {
+            HashMap::new()
+        };
+
+        let transactions: Vec<OpenTransaction> = found
+            .into_iter()
+            .map(|row| {
+                let id = row.0;
+                let mut trx =
+                    open_transaction(row, owners.get(&id), last.remove(&id), self.max_sql_text);
+                trx.blocked_by = waits.get(&id).cloned().unwrap_or_default();
+                trx
+            })
+            .collect();
+        let note = (!self.perf_schema && transactions.iter().any(|t| t.idle)).then(|| {
+            "performance_schema is OFF, so what an idle transaction ran last is not known"
+                .to_string()
+        });
+        (transactions, note)
+    }
+
+    /// Which session waits for which, from performance_schema. MySQL 8.0 only: elsewhere the table
+    /// is missing and nobody is reported as waiting.
+    fn lock_waits(&mut self) -> HashMap<u64, Vec<u64>> {
+        let mut blockers: HashMap<u64, Vec<u64>> = HashMap::new();
+        if !self.perf_schema {
+            return blockers;
+        }
+        let waits = self.conn.query::<(u64, u64), _>(
+            "SELECT waiting.PROCESSLIST_ID, blocking.PROCESSLIST_ID \
+             FROM performance_schema.data_lock_waits w \
+             JOIN performance_schema.threads waiting ON waiting.THREAD_ID = w.REQUESTING_THREAD_ID \
+             JOIN performance_schema.threads blocking ON blocking.THREAD_ID = w.BLOCKING_THREAD_ID",
+        );
+        for (waiting, blocking) in waits.unwrap_or_default() {
+            let list = blockers.entry(waiting).or_default();
+            if !list.contains(&blocking) {
+                list.push(blocking);
+            }
+        }
+        blockers
     }
 
     /// Adds what performance_schema and InnoDB know about each statement. Each source is optional:
@@ -323,32 +418,17 @@ impl Session {
             ]);
         }
 
-        if self.perf_schema {
-            // MySQL 8.0 only; elsewhere the table is missing and this is skipped.
-            let waits = self.conn.query::<(u64, u64), _>(
-                "SELECT waiting.PROCESSLIST_ID, blocking.PROCESSLIST_ID \
-                 FROM performance_schema.data_lock_waits w \
-                 JOIN performance_schema.threads waiting ON waiting.THREAD_ID = w.REQUESTING_THREAD_ID \
-                 JOIN performance_schema.threads blocking ON blocking.THREAD_ID = w.BLOCKING_THREAD_ID",
-            );
-            let mut blockers: HashMap<u64, Vec<u64>> = HashMap::new();
-            for (waiting, blocking) in waits.unwrap_or_default() {
-                let list = blockers.entry(waiting).or_default();
-                if !list.contains(&blocking) {
-                    list.push(blocking);
-                }
-            }
-            for (id, list) in blockers {
-                let list = list
-                    .iter()
-                    .map(|b| format!("thread {b}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                details
-                    .entry(id)
-                    .or_default()
-                    .push(("blocked_by".to_string(), list));
-            }
+        let blockers = self.lock_waits();
+        for (id, list) in &blockers {
+            let list = list
+                .iter()
+                .map(|b| format!("thread {b}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            details
+                .entry(*id)
+                .or_default()
+                .push(("blocked_by".to_string(), list));
         }
 
         for query in running {
@@ -357,6 +437,9 @@ impl Session {
             }
             if let Some(found) = details.remove(&query.id) {
                 query.details = found;
+            }
+            if let Some(list) = blockers.get(&query.id) {
+                query.blocked_by = list.clone();
             }
         }
     }
@@ -625,6 +708,92 @@ fn ssl_opts(target: &Target) -> Option<SslOpts> {
     }
 }
 
+/// What the process list says about the session that owns a transaction.
+struct Owner {
+    user: String,
+    host: String,
+    db: String,
+    /// Between statements.
+    idle: bool,
+}
+
+/// A text column of a process list row, whatever its type, `NULL` as empty.
+fn text(row: &Row, column: &str) -> String {
+    row.get_opt::<Option<Vec<u8>>, _>(column)
+        .and_then(Result::ok)
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+/// The sessions of a process list by connection id.
+fn owners_of(rows: &[Row]) -> HashMap<u64, Owner> {
+    rows.iter()
+        .filter_map(|row| {
+            let id = row.get_opt::<u64, _>("Id")?.ok()?;
+            let host = text(row, "Host");
+            Some((
+                id,
+                Owner {
+                    user: text(row, "User"),
+                    host: host
+                        .rsplit_once(':')
+                        .map_or(host.clone(), |(host, _port)| host.to_string()),
+                    db: text(row, "db"),
+                    idle: text(row, "Command") == "Sleep",
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The statements in flight, and how many sessions the list held.
+fn running_from(rows: Vec<Row>, own_id: u64) -> (Vec<RunningQuery>, usize) {
+    let visible = rows.len();
+    (
+        rows.into_iter()
+            .filter_map(|row| process_from_row(row, own_id))
+            .collect(),
+        visible,
+    )
+}
+
+/// A row of `INNODB_TRX`: thread, state, age in seconds, rows locked, rows modified, statement.
+type TrxRow = (u64, String, i64, u64, u64, Option<String>);
+
+/// `trx_query` is cut at this many bytes.
+const TRX_QUERY_LIMIT: usize = 1024;
+
+/// One transaction with its session. The statement it runs now is `trx_query`; a session between
+/// statements has none, and `last` is what performance_schema remembers it ran.
+fn open_transaction(
+    row: TrxRow,
+    owner: Option<&Owner>,
+    last: Option<String>,
+    max_sql_text: usize,
+) -> OpenTransaction {
+    let (id, state, age, locked, modified, query) = row;
+    let (sql, limit) = match (query.filter(|q| !q.is_empty()), last) {
+        (Some(running), _) => (running, TRX_QUERY_LIMIT),
+        (None, Some(last)) => (last, max_sql_text),
+        (None, None) => (String::new(), usize::MAX),
+    };
+    OpenTransaction {
+        id,
+        user: owner.map(|o| o.user.clone()).unwrap_or_default(),
+        host: owner.map(|o| o.host.clone()).unwrap_or_default(),
+        db: owner.map(|o| o.db.clone()).unwrap_or_default(),
+        secs: age.max(0) as f64,
+        idle: owner.is_some_and(|o| o.idle),
+        state,
+        rows_locked: Some(locked),
+        rows_modified: Some(modified),
+        truncated: sql.len() >= limit,
+        sql,
+        blocked_by: Vec::new(),
+    }
+}
+
 fn process_from_row(mut row: Row, own_id: u64) -> Option<RunningQuery> {
     let id: u64 = row.take_opt("Id")?.ok()?;
     let user = string(&mut row, "User").unwrap_or_default();
@@ -652,6 +821,7 @@ fn process_from_row(mut row: Row, own_id: u64) -> Option<RunningQuery> {
         sql,
         truncated: false,
         details: Vec::new(),
+        blocked_by: Vec::new(),
     })
 }
 
@@ -904,7 +1074,74 @@ mod tests {
             sql: sql.to_string(),
             truncated: false,
             details: Vec::new(),
+            blocked_by: Vec::new(),
         }
+    }
+
+    fn owner(idle: bool) -> Owner {
+        Owner {
+            user: "app".into(),
+            host: "10.0.0.5".into(),
+            db: "shop".into(),
+            idle,
+        }
+    }
+
+    fn trx_row(query: Option<&str>, age: i64) -> TrxRow {
+        (42, "RUNNING".into(), age, 3, 1, query.map(String::from))
+    }
+
+    #[test]
+    fn a_session_with_a_statement_running_shows_that_statement() {
+        let trx = open_transaction(
+            trx_row(Some("UPDATE t SET a = 1"), 12),
+            Some(&owner(false)),
+            Some("an older statement".into()),
+            1024,
+        );
+        assert_eq!(
+            (trx.sql.as_str(), trx.idle, trx.secs),
+            ("UPDATE t SET a = 1", false, 12.0)
+        );
+        assert_eq!(
+            (trx.user.as_str(), trx.host.as_str(), trx.db.as_str()),
+            ("app", "10.0.0.5", "shop")
+        );
+        assert_eq!((trx.rows_locked, trx.rows_modified), (Some(3), Some(1)));
+    }
+
+    #[test]
+    fn an_idle_session_shows_the_last_statement_performance_schema_remembers() {
+        let trx = open_transaction(
+            trx_row(None, 90),
+            Some(&owner(true)),
+            Some("UPDATE accounts SET b = 2".into()),
+            1024,
+        );
+        assert!(trx.idle && !trx.truncated);
+        assert_eq!(trx.sql, "UPDATE accounts SET b = 2");
+    }
+
+    #[test]
+    fn without_performance_schema_what_an_idle_session_ran_is_not_known() {
+        let trx = open_transaction(trx_row(None, 90), Some(&owner(true)), None, 1024);
+        assert!(trx.idle && trx.sql.is_empty() && !trx.truncated);
+    }
+
+    #[test]
+    fn text_as_long_as_the_servers_limit_is_flagged_as_cut() {
+        let long = "x".repeat(1024);
+        assert!(open_transaction(trx_row(Some(&long), 1), None, None, 4096).truncated);
+        assert!(!open_transaction(trx_row(Some("short"), 1), None, None, 4096).truncated);
+        let remembered = open_transaction(trx_row(None, 1), None, Some("y".repeat(100)), 100);
+        assert!(remembered.truncated, "performance_schema's own limit");
+    }
+
+    #[test]
+    fn a_session_the_process_list_lost_and_a_clock_that_ran_backwards_do_no_harm() {
+        let trx = open_transaction(trx_row(Some("q"), -3), None, None, 1024);
+        assert_eq!((trx.secs, trx.idle), (0.0, false));
+        assert!(trx.user.is_empty() && trx.host.is_empty() && trx.db.is_empty());
     }
 
     #[test]
@@ -1679,6 +1916,118 @@ mod live {
         let after = wait_for(|| history(&mut mon).filter(|length| *length >= before + 250.0));
         reader.query_drop("ROLLBACK").unwrap();
         assert!(after >= before + 250.0, "{before} -> {after}");
+    }
+
+    /// A session that updates a row and then sits there, the way a forgotten transaction does:
+    /// idle, so nothing the running list shows. It rolls back after `seconds`.
+    fn idle_holder(port: u16, row: u32, marker: &str, seconds: u64) -> JoinHandle<()> {
+        let marker = marker.to_string();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut conn = app_conn(port);
+            conn.query_drop("BEGIN").unwrap();
+            conn.query_drop(format!(
+                "UPDATE shop.orders SET amount = amount WHERE id = {row} /* {marker} */"
+            ))
+            .unwrap();
+            ready_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(seconds));
+            conn.query_drop("ROLLBACK").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        holder
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn an_idle_transaction_is_listed_with_what_it_ran_last_and_the_update_it_blocks_points_at_it() {
+        let holder = idle_holder(PORT, 95, "live-idle-holder", 6);
+        let waiter =
+            work("UPDATE shop.orders SET amount = amount WHERE id = 95 /* live-idle-waiter */");
+
+        let mut mon = least();
+        let sample = wait_for(|| {
+            let sample = mon.poll().unwrap();
+            let held = sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains("live-idle-holder"))?;
+            let waits = sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains("live-idle-waiter"))?;
+            (held.idle && !waits.blocked_by.is_empty()).then_some(sample)
+        });
+        let find = |marker: &str| {
+            sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains(marker))
+                .unwrap()
+        };
+        let (held, waits) = (find("live-idle-holder"), find("live-idle-waiter"));
+
+        assert!(held.idle && held.user == "app", "{held:?}");
+        assert!(
+            held.rows_locked.unwrap() >= 1 && held.rows_modified.is_some(),
+            "{held:?}"
+        );
+        assert!(
+            sample.running.iter().all(|q| q.id != held.id),
+            "an idle session runs nothing, which is why the list needs this tab"
+        );
+        assert!(sample.transactions_note.is_none());
+        assert_eq!(waits.blocked_by, [held.id]);
+        assert!(
+            !waits.idle && waits.state.eq_ignore_ascii_case("LOCK WAIT"),
+            "{waits:?}"
+        );
+
+        // The running list says the same, in a field the screen can use.
+        let running = sample
+            .running
+            .iter()
+            .find(|q| q.sql.contains("live-idle-waiter"))
+            .unwrap();
+        assert_eq!(running.blocked_by, [held.id]);
+
+        holder.join().unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs: docker compose -f dev/compose.yaml --profile extra up -d --wait"]
+    fn without_performance_schema_an_idle_transaction_is_listed_but_what_it_ran_is_not_known() {
+        let holder = idle_holder(PORT_NO_PS, 95, "live-idle-nops", 4);
+        let mut mon = monitor("root", "root", PORT_NO_PS);
+        let sample = wait_for(|| {
+            Some(mon.poll().unwrap()).filter(|s| s.transactions.iter().any(|t| t.idle))
+        });
+        let held = sample.transactions.iter().find(|t| t.idle).unwrap();
+        assert!(held.sql.is_empty(), "{held:?}");
+        assert!(
+            sample
+                .transactions_note
+                .as_deref()
+                .unwrap()
+                .contains("performance_schema is OFF"),
+            "{:?}",
+            sample.transactions_note
+        );
+        holder.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn an_account_that_cannot_read_innodb_says_so_instead_of_listing_nothing() {
+        let sample = monitor("blind", "blind", PORT).poll().unwrap();
+        assert!(sample.transactions.is_empty());
+        let note = sample.transactions_note.expect("a note");
+        assert!(
+            note.contains("cannot read InnoDB transactions") && note.contains("PROCESS"),
+            "{note}"
+        );
+        assert!(least().poll().unwrap().transactions_note.is_none());
     }
 
     #[test]

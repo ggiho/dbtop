@@ -33,6 +33,11 @@ pub struct Sample {
     pub running: Vec<RunningQuery>,
     /// Why `running` may be incomplete: the account can't see other users' sessions.
     pub running_note: Option<String>,
+    /// Transactions open on the server, sessions that are idle included: the ones `running`
+    /// leaves out, and where a transaction that holds locks for nothing usually is.
+    pub transactions: Vec<OpenTransaction>,
+    /// Why `transactions` may be incomplete, when the cause is not a quiet server.
+    pub transactions_note: Option<String>,
     /// Whether the connection really is encrypted, as the server reports it: with `prefer` that
     /// is only known after the handshake. `None` where there is no connection.
     pub encrypted: Option<bool>,
@@ -54,6 +59,32 @@ pub struct RunningQuery {
     /// The server cut the text (e.g. `track_activity_query_size`), so EXPLAIN would be wrong.
     pub truncated: bool,
     pub details: Vec<(String, String)>,
+    /// The sessions it waits for.
+    pub blocked_by: Vec<u64>,
+}
+
+/// A transaction that is open on the server, whether or not its session runs anything now.
+#[derive(Debug, Clone)]
+pub struct OpenTransaction {
+    /// MySQL connection id / Postgres pid.
+    pub id: u64,
+    pub user: String,
+    pub host: String,
+    pub db: String,
+    /// How long it has been open.
+    pub secs: f64,
+    /// The session is between statements: it holds what it took and does nothing with it.
+    pub idle: bool,
+    /// The server's own word for it (`RUNNING`, `LOCK WAIT`, `idle in transaction`).
+    pub state: String,
+    /// Rows locked and modified so far, where the server counts them.
+    pub rows_locked: Option<u64>,
+    pub rows_modified: Option<u64>,
+    /// The statement it runs now, or the last one it ran. Empty where that is not known.
+    pub sql: String,
+    pub truncated: bool,
+    /// The sessions it waits for.
+    pub blocked_by: Vec<u64>,
 }
 
 /// Aggregated statistics of one normalized statement (a digest).
@@ -85,6 +116,8 @@ pub enum ExplainTarget {
 pub enum PlanKey {
     Running(u64),
     Digest(String),
+    /// A transaction is not explained; the key only says whose details these are.
+    Transaction(u64),
 }
 
 impl ExplainTarget {

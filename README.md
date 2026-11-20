@@ -16,7 +16,7 @@ Needs a terminal of at least 80x20; a larger one shows more graphs.
 | Key | |
 |---|---|
 | `↑↓` `j k` `PgUp PgDn` `g G` | move |
-| `Tab` `1` `2` | running / slow |
+| `Tab` `1` `2` `3` | running / slow / transactions |
 | `Enter` | details: full SQL (syntax-coloured), info, plan. `↑↓ g G` scroll, `Esc` closes |
 | `q` `Ctrl-C` | quit |
 
@@ -64,6 +64,29 @@ The SQL in the details is coloured: keywords, function calls, strings, numbers, 
 names and placeholders. It is a small lexer for MySQL and Postgres text, not a parser, so an odd
 statement may be coloured a little wrong but is never changed or cut. A statement over 64 KB is
 shown plain.
+
+## Who holds the lock
+
+A red `Oldest Xact`, `History List` or `Lock Waits` does not say who. The Running tab cannot: it
+lists statements being run, and a session that is idle inside a transaction runs none. The third
+tab, `3 transactions`, lists every open transaction, idle ones included, oldest first:
+
+| | |
+|---|---|
+| `AGE` | how long it has been open, in the colours of the `Oldest Xact` graph (yellow from a minute, red from ten) |
+| `STATE` | `idle` (between statements, yellow once it holds rows or has been idle for ten seconds), `running`, `lock wait`, `aborted` |
+| `LOCKS` | rows it has locked (MySQL; Postgres does not count them) |
+| `WAIT` | `← 8841` it waits for that session, `→ 2` two sessions wait for it |
+| `QUERY` | the statement it runs now, or for an idle session the last one it ran |
+
+The `WAIT` marks are also in front of the `STATE` in the Running list, where a statement that is
+blocked shows `← 8841` and one that blocks others `→ 2`. `Enter` on a transaction opens its
+session, how long it has been open, what it waits for and who waits for it, and the statement.
+There is no plan: a transaction is not a statement.
+
+The last statement is not always the one that took the locks. MySQL has it from
+`performance_schema` (with that off the statement is shown as not known, and a warning says why);
+Postgres has it in `pg_stat_activity`. dbtop changes nothing on the server: it does not kill sessions.
 
 ## The servers dbq knows
 

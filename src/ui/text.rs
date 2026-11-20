@@ -56,6 +56,24 @@ pub(super) fn printable(c: char) -> char {
 
 /// Collapses a statement to one line for a table cell. Only the head is kept: no cell is
 /// wider than a screen, and statements can be megabytes.
+/// The end of `text` that fits `width` columns, with `…` in front when something was cut.
+pub fn tail(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for c in text.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
 pub fn one_line(s: &str) -> String {
     let head: String = s.chars().take(512).map(printable).collect();
     head.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -148,6 +166,18 @@ mod tests {
         assert_eq!(fmt_count(1234.0), "1.2k");
         assert_eq!(fmt_count(25_000.0), "25k");
         assert_eq!(fmt_count(1_500_000.0), "1.5M");
+    }
+
+    #[test]
+    fn tail_keeps_the_end_that_fits() {
+        assert_eq!(tail("orders", 6), "orders");
+        assert_eq!(tail("orders", 4), "…ers");
+        assert_eq!(
+            tail("주문 테이블", 7),
+            "…테이블",
+            "wide letters count double"
+        );
+        assert_eq!(tail("orders", 1), "…");
     }
 
     #[test]

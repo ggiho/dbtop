@@ -20,7 +20,9 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{Backend, guard};
 use crate::config::{Target, Tls};
-use crate::model::{ExplainTarget, Plan, Raw, Reading, RunningQuery, Sample, SlowQuery};
+use crate::model::{
+    ExplainTarget, OpenTransaction, Plan, Raw, Reading, RunningQuery, Sample, SlowQuery,
+};
 
 const MAX_DIGESTS: i64 = 100;
 
@@ -48,6 +50,16 @@ const RUNNING: &str = "\
     FROM pg_stat_activity a \
     WHERE a.backend_type = 'client backend' AND a.state = 'active' AND a.pid <> pg_backend_pid() \
     ORDER BY a.query_start";
+
+/// Every transaction open now, oldest first: the sessions that are idle in one are in it, which
+/// `RUNNING` leaves out. For a session between statements `query` is the last one it ran.
+const TRANSACTIONS: &str = "\
+    SELECT a.pid, COALESCE(a.usename, ''), COALESCE(host(a.client_addr), ''), COALESCE(a.datname, ''), \
+           COALESCE(a.state, ''), EXTRACT(EPOCH FROM (now() - a.xact_start))::float8, \
+           COALESCE(a.query, ''), octet_length(a.query) >= $1 - 1, pg_blocking_pids(a.pid) \
+    FROM pg_stat_activity a \
+    WHERE a.backend_type = 'client backend' AND a.xact_start IS NOT NULL AND a.pid <> pg_backend_pid() \
+    ORDER BY a.xact_start LIMIT 200";
 
 /// Cluster-wide counters from pg_stat_database and what the client sessions are doing, in one
 /// round trip.
@@ -366,6 +378,7 @@ impl Session {
         let max_connections: i32 = row.try_get("max_connections")?;
 
         let running = self.running()?;
+        let transactions = self.transactions()?;
         let (slow, slow_note, calls) = self.statements();
 
         Ok(Sample {
@@ -376,6 +389,8 @@ impl Session {
             running,
             encrypted: Some(self.encrypted),
             running_note: (!self.sees_all).then(|| HIDDEN_NOTE.to_string()),
+            transactions,
+            transactions_note: (!self.sees_all).then(|| HIDDEN_NOTE.to_string()),
             slow,
             slow_note,
         })
@@ -384,6 +399,13 @@ impl Session {
     fn running(&mut self) -> Result<Vec<RunningQuery>> {
         let rows = self.client.query(RUNNING, &[&self.query_size])?;
         rows.iter().map(|row| Ok(running_from_row(row)?)).collect()
+    }
+
+    fn transactions(&mut self) -> Result<Vec<OpenTransaction>> {
+        let rows = self.client.query(TRANSACTIONS, &[&self.query_size])?;
+        rows.iter()
+            .map(|row| Ok(transaction_from_row(row)?))
+            .collect()
     }
 
     /// The statements that have used the most time in total, from pg_stat_statements, and the
@@ -600,6 +622,28 @@ fn running_from_row(row: &Row) -> Result<RunningQuery, postgres::Error> {
         sql: row.try_get(6)?,
         truncated: row.try_get(7)?,
         details,
+        blocked_by: blockers.iter().map(|&b| b as u64).collect(),
+    })
+}
+
+fn transaction_from_row(row: &Row) -> Result<OpenTransaction, postgres::Error> {
+    let pid: i32 = row.try_get(0)?;
+    let state: String = row.try_get(4)?;
+    let blockers: Vec<i32> = row.try_get(8)?;
+    Ok(OpenTransaction {
+        id: pid as u64,
+        user: row.try_get(1)?,
+        host: row.try_get(2)?,
+        db: row.try_get(3)?,
+        secs: row.try_get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+        idle: state.starts_with("idle in transaction"),
+        state,
+        // PostgreSQL does not count them.
+        rows_locked: None,
+        rows_modified: None,
+        sql: row.try_get(6)?,
+        truncated: row.try_get(7)?,
+        blocked_by: blockers.iter().map(|&b| b as u64).collect(),
     })
 }
 
@@ -1444,6 +1488,76 @@ mod live {
         assert!(after > before);
     }
 
+    /// A session that updates a row and then sits idle in its transaction, as a forgotten one
+    /// does. It rolls back after `seconds`.
+    fn idle_holder(row: u32, marker: &str, seconds: u64) -> JoinHandle<()> {
+        let marker = marker.to_string();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut client = app_client(PORT, "shop");
+            client
+                .batch_execute(&format!(
+                    "BEGIN; UPDATE orders SET amount = amount WHERE id = {row} /* {marker} */"
+                ))
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(seconds));
+            client.batch_execute("ROLLBACK").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        holder
+    }
+
+    #[test]
+    #[ignore = "needs dev/compose.yaml"]
+    fn a_session_idle_in_a_transaction_is_listed_and_the_update_it_blocks_points_at_it() {
+        let holder = idle_holder(95, "live-idle-holder", 6);
+        let waiter = work("UPDATE orders SET amount = amount WHERE id = 95 /* live-idle-waiter */");
+
+        let mut mon = least();
+        let sample = wait_for(|| {
+            let sample = mon.poll().unwrap();
+            let held = sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains("live-idle-holder"))?;
+            let waits = sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains("live-idle-waiter"))?;
+            (held.idle && !waits.blocked_by.is_empty()).then_some(sample)
+        });
+        let find = |marker: &str| {
+            sample
+                .transactions
+                .iter()
+                .find(|t| t.sql.contains(marker))
+                .unwrap()
+        };
+        let (held, waits) = (find("live-idle-holder"), find("live-idle-waiter"));
+
+        assert_eq!(held.state, "idle in transaction");
+        assert!(held.idle && held.user == "app", "{held:?}");
+        assert!(held.rows_locked.is_none(), "Postgres does not count them");
+        assert!(
+            sample.running.iter().all(|q| q.id != held.id),
+            "an idle session runs nothing, which is why the list needs this tab"
+        );
+        assert!(sample.transactions_note.is_none());
+        assert_eq!(waits.blocked_by, [held.id]);
+        assert!(!waits.idle, "{waits:?}");
+
+        let running = sample
+            .running
+            .iter()
+            .find(|q| q.sql.contains("live-idle-waiter"))
+            .unwrap();
+        assert_eq!(running.blocked_by, [held.id]);
+
+        holder.join().unwrap();
+        waiter.join().unwrap();
+    }
+
     #[test]
     #[ignore = "needs dev/compose.yaml"]
     fn a_lock_wait_an_open_transaction_and_an_idle_one_show_up_in_the_gauges() {
@@ -1538,6 +1652,12 @@ mod live {
             sample.running
         );
         assert!(sample.running_note.unwrap().contains("pg_read_all_stats"));
+        assert!(
+            sample
+                .transactions_note
+                .unwrap()
+                .contains("pg_read_all_stats")
+        );
         assert!(
             least().poll().unwrap().running_note.is_none(),
             "pg_monitor sees everything"

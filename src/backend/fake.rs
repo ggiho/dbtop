@@ -8,7 +8,8 @@ use anyhow::Result;
 
 use super::Backend;
 use crate::model::{
-    ExplainTarget, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample, SlowQuery,
+    ExplainTarget, OpenTransaction, Plan, PlanTable, PlanViews, Raw, Reading, RunningQuery, Sample,
+    SlowQuery,
 };
 
 struct Template {
@@ -70,6 +71,11 @@ impl DemoPlan {
         }
     }
 }
+
+/// A session that sits in a transaction holding rows the blocked update waits for. Its id is below
+/// the ones the running statements get.
+const HOLDER: u64 = 7_711;
+const READER: u64 = 7_712;
 
 /// The one template whose text is generated and cut like a server with a small
 /// `track_activity_query_size` would.
@@ -460,6 +466,63 @@ impl Fake {
     }
 }
 
+/// Transactions as a busy server shows them: two sessions idle in one, the first holding the rows
+/// the blocked update waits for, and a transaction for each statement that has run a while.
+fn demo_transactions(t: f64, running: &[RunningQuery]) -> Vec<OpenTransaction> {
+    let idle = |id, user: &str, host: &str, db: &str, secs, locked, sql: &str| OpenTransaction {
+        id,
+        user: user.to_string(),
+        host: host.to_string(),
+        db: db.to_string(),
+        secs,
+        idle: true,
+        state: "idle in transaction".to_string(),
+        rows_locked: Some(locked),
+        rows_modified: Some(locked),
+        sql: sql.to_string(),
+        truncated: false,
+        blocked_by: Vec::new(),
+    };
+    let mut all = vec![
+        idle(
+            HOLDER,
+            "batch_settle",
+            "10.20.4.8",
+            "settlement",
+            60.0 + t % 240.0,
+            1_204,
+            "UPDATE settlement_items SET status = 'HOLD' WHERE batch_id = 7731",
+        ),
+        idle(
+            READER,
+            "bi_reader",
+            "10.20.7.31",
+            "payments",
+            20.0 + t % 90.0,
+            0,
+            "SELECT COUNT(*) FROM payments WHERE created_at >= '2026-10-01'",
+        ),
+    ];
+    all.extend(running.iter().filter(|q| q.secs >= 2.0).map(|q| {
+        let waits = !q.blocked_by.is_empty();
+        OpenTransaction {
+            id: q.id,
+            user: q.user.clone(),
+            host: q.host.clone(),
+            db: q.db.clone(),
+            secs: q.secs,
+            idle: false,
+            state: if waits { "LOCK WAIT" } else { "RUNNING" }.to_string(),
+            rows_locked: Some(u64::from(waits)),
+            rows_modified: Some(0),
+            sql: q.sql.clone(),
+            truncated: q.truncated,
+            blocked_by: q.blocked_by.clone(),
+        }
+    }));
+    all
+}
+
 fn digest(i: usize) -> String {
     format!(
         "{:032x}",
@@ -562,7 +625,7 @@ impl Backend for Fake {
                     ),
                 ];
                 if tpl.blocked {
-                    details.push(("blocked_by".to_string(), "thread 8841".to_string()));
+                    details.push(("blocked_by".to_string(), format!("thread {HOLDER}")));
                 }
                 RunningQuery {
                     id: a.id,
@@ -574,9 +637,15 @@ impl Backend for Fake {
                     sql: a.sql.clone(),
                     truncated: a.tpl == BIG_IN_LIST,
                     details,
+                    blocked_by: if tpl.blocked {
+                        vec![HOLDER]
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect();
+        let transactions = demo_transactions(t, &running);
 
         let slow = SLOW
             .iter()
@@ -631,7 +700,7 @@ impl Backend for Fake {
             },
             Reading {
                 key: "oldest_xact",
-                raw: Raw::Gauge(running.iter().map(|q| q.secs).fold(0.0, f64::max)),
+                raw: Raw::Gauge(transactions.iter().map(|t| t.secs).fold(0.0, f64::max)),
             },
             Reading {
                 key: "hll",
@@ -654,6 +723,8 @@ impl Backend for Fake {
             max_connections: 500,
             running,
             running_note: None,
+            transactions,
+            transactions_note: None,
             encrypted: None,
             slow,
             slow_note: None,
@@ -732,6 +803,54 @@ mod tests {
                 other => panic!("no plan for {}: {other:?}", slow.sample_sql),
             }
         }
+    }
+
+    #[test]
+    fn the_demo_has_an_idle_session_holding_what_the_blocked_update_waits_for() {
+        let mut fake = Fake::seeded(7);
+        let blocked = TEMPLATES.iter().position(|t| t.blocked).unwrap();
+        fake.start_query(blocked, 5.0);
+        let sample = fake.poll().unwrap();
+
+        let holder = sample
+            .transactions
+            .iter()
+            .find(|t| t.id == HOLDER)
+            .expect("the idle holder is listed");
+        assert!(holder.idle && holder.rows_locked.unwrap() > 0);
+        assert!(
+            sample.running.iter().all(|q| q.id != HOLDER),
+            "an idle session runs nothing"
+        );
+
+        let waiting = sample
+            .running
+            .iter()
+            .find(|q| !q.blocked_by.is_empty())
+            .expect("the blocked update");
+        assert_eq!(waiting.blocked_by, [HOLDER]);
+        let trx = sample
+            .transactions
+            .iter()
+            .find(|t| t.id == waiting.id)
+            .expect("it is a transaction too");
+        assert_eq!(
+            (trx.state.as_str(), trx.blocked_by.as_slice()),
+            ("LOCK WAIT", &[HOLDER][..])
+        );
+
+        // The graph and the list tell the same story.
+        let oldest = sample
+            .metrics
+            .iter()
+            .find(|m| m.key == "oldest_xact")
+            .unwrap();
+        let longest = sample
+            .transactions
+            .iter()
+            .map(|t| t.secs)
+            .fold(0.0, f64::max);
+        assert!(matches!(oldest.raw, Raw::Gauge(g) if g == longest));
     }
 
     #[test]

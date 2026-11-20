@@ -14,12 +14,12 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Detail, PlanState, Subject, Tab};
-use crate::model::{Plan, PlanTable, PlanViews, Sample};
+use crate::app::{App, Detail, Filter, PlanState, SlowSort, Subject, Tab, waiter_counts};
+use crate::model::{OpenTransaction, Plan, PlanTable, PlanViews, RunningQuery, Sample, SlowQuery};
 use graph::{BrailleGraph, axis_max, visible};
 use metrics::{Spec, spec};
 use sql::highlight;
-use text::{fmt_count, fmt_ms, fmt_secs, one_line, printable, wrap_words};
+use text::{fmt_count, fmt_ms, fmt_secs, one_line, printable, tail, wrap_words};
 use theme::THEME;
 
 fn fg(color: Color) -> Style {
@@ -82,6 +82,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_table(f, app, main);
     draw_footer(f, app, footer);
     draw_detail(f, app, area);
+    if app.help {
+        draw_help(f, area);
+    }
 }
 
 /// Panels across and down for a terminal of this size. Each wants about 32 columns, and each row
@@ -350,25 +353,59 @@ fn gauge(label: &str, value: f64, max: f64, shown: String, width: u16) -> Line<'
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let counts = app
+    let counts = app.sample.as_ref().map_or((0, 0, 0), |s| {
+        (s.running.len(), s.slow.len(), s.transactions.len())
+    });
+    // With a filter on, how many of each it lets through.
+    let shown = match &app.sample {
+        Some(s) if app.filter.is_on() => (
+            app.filter.running(s).len(),
+            app.filter.slow(s).len(),
+            app.filter.transactions(s).len(),
+        ),
+        _ => counts,
+    };
+    // A transaction open for long is why the tab is not left to look quiet.
+    let oldest = app
         .sample
         .as_ref()
-        .map_or((0, 0), |s| (s.running.len(), s.slow.len()));
-    let tab = |key: &str, name: &str, n: usize, active: bool| {
-        let style = if active {
-            fg(THEME.accent).bold()
-        } else {
-            fg(THEME.dim)
+        .and_then(|s| s.transactions.iter().map(|t| t.secs).reduce(f64::max))
+        .map_or(THEME.dim, age_colour);
+    let tab = |key: &str, name: &str, n: (usize, usize), active: bool, alert: Option<Color>| {
+        let style = match (active, alert) {
+            (true, _) => fg(THEME.accent).bold(),
+            (false, Some(alert)) => fg(alert),
+            (false, None) => fg(THEME.dim),
         };
-        tag(vec![Span::styled(format!(" {key} {name} {n} "), style)])
+        let count = match n {
+            (shown, all) if shown == all => all.to_string(),
+            (shown, all) => format!("{shown}/{all}"),
+        };
+        tag(vec![Span::styled(format!(" {key} {name} {count} "), style)])
     };
-    let block = panel(
-        [
-            tab("1", "running", counts.0, app.tab == Tab::Running),
-            tab("2", "slow", counts.1, app.tab == Tab::Slow),
-        ]
-        .concat(),
-    );
+    let tabs = [
+        tab(
+            "1",
+            "running",
+            (shown.0, counts.0),
+            app.tab == Tab::Running,
+            None,
+        ),
+        tab("2", "slow", (shown.1, counts.1), app.tab == Tab::Slow, None),
+        tab(
+            "3",
+            "transactions",
+            (shown.2, counts.2),
+            app.tab == Tab::Transactions,
+            [THEME.warn, THEME.crit].contains(&oldest).then_some(oldest),
+        ),
+    ]
+    .concat();
+    let room = usize::from(area.width).saturating_sub(Line::from(tabs.clone()).width() + 3);
+    let mut block = panel(tabs);
+    if let Some(filter) = filter_tag(&app.filter, room) {
+        block = block.title_top(filter.right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -377,6 +414,9 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         tab,
         running_sel,
         slow_sel,
+        slow_sort,
+        trx_sel,
+        filter,
         ..
     } = app;
     let Some(sample) = sample.as_ref() else {
@@ -384,22 +424,88 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     };
     match tab {
         Tab::Running => {
-            let table = match &sample.running_note {
-                Some(note) => {
-                    let [banner, table] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-                    f.render_widget(
-                        Paragraph::new(format!("⚠ {note}")).style(fg(THEME.warn)),
-                        banner,
-                    );
-                    table
-                }
-                None => inner,
-            };
-            running_table(f, table, sample, &mut running_sel.state);
+            let table = banner(f, inner, sample.running_note.as_deref());
+            let rows = filter.running(sample);
+            running_table(f, table, sample, &rows, &mut running_sel.state);
         }
-        Tab::Slow => slow_table(f, inner, sample, &mut slow_sel.state),
+        Tab::Slow => {
+            let rows = filter.slow(sample);
+            slow_table(f, inner, sample, &rows, &mut slow_sel.state, *slow_sort);
+        }
+        Tab::Transactions => {
+            // With nothing to list the note is the whole screen; with a list it is a warning above it.
+            let warning = sample
+                .transactions_note
+                .as_deref()
+                .filter(|_| !sample.transactions.is_empty());
+            let table = banner(f, inner, warning);
+            let rows = filter.transactions(sample);
+            transactions_table(f, table, sample, &rows, &mut trx_sel.state);
+        }
     }
+}
+
+/// The filter as the table's border carries it, like a search box. Where it does not fit, the
+/// end of it: that is where the typing is.
+fn filter_tag(filter: &Filter, room: usize) -> Option<Line<'static>> {
+    if !filter.typing && !filter.is_on() {
+        return None;
+    }
+    // The tag's two edges, the slash with its spaces, the cursor and the space after it.
+    let room = room.checked_sub(2 + 3 + 1 + 1)?.max(1);
+    let mut parts = vec![
+        Span::styled(" / ", fg(THEME.accent).bold()),
+        Span::styled(tail(&filter.text, room), fg(THEME.text)),
+    ];
+    parts.push(if filter.typing {
+        Span::styled("█", fg(THEME.accent))
+    } else {
+        Span::raw(" ")
+    });
+    parts.push(Span::raw(" "));
+    Some(Line::from(tag(parts)))
+}
+
+/// What a list says when the filter lets nothing through.
+const NO_MATCH: &str = "nothing matches the filter  ·  Esc clears it";
+
+/// The warning line above a table, if there is one; what is left of `area` for the table.
+fn banner(f: &mut Frame, area: Rect, warning: Option<&str>) -> Rect {
+    let Some(warning) = warning else { return area };
+    let [line, table] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(format!("⚠ {warning}")).style(fg(THEME.warn)),
+        line,
+    );
+    table
+}
+
+/// How old a transaction is, in the colours of the Oldest Xact graph.
+fn age_colour(secs: f64) -> Color {
+    match spec("oldest_xact") {
+        Some(spec) if secs >= 1.0 => spec.tone(secs),
+        _ => THEME.dim,
+    }
+}
+
+/// What a session's locks make of it: waiting for another (`← 8841`) and making others wait
+/// (`→ 2`). The arrow points the way the waiting goes.
+fn lock_marks(blocked_by: &[u64], waiters: usize) -> Vec<Span<'static>> {
+    let mut marks = Vec::new();
+    if let Some(first) = blocked_by.first() {
+        let more = match blocked_by.len() {
+            1 => String::new(),
+            n => format!("+{}", n - 1),
+        };
+        marks.push(Span::styled(format!("← {first}{more}"), fg(THEME.warn)));
+    }
+    if waiters > 0 {
+        if !marks.is_empty() {
+            marks.push(Span::raw(" "));
+        }
+        marks.push(Span::styled(format!("→ {waiters}"), fg(THEME.crit).bold()));
+    }
+    marks
 }
 
 fn note(f: &mut Frame, area: Rect, text: &str) {
@@ -420,23 +526,42 @@ fn selected() -> Style {
     Style::new().bg(THEME.selection).bold()
 }
 
-fn running_table(f: &mut Frame, area: Rect, sample: &Sample, state: &mut TableState) {
-    if sample.running.is_empty() {
-        return note(f, area, "no running queries");
+fn running_table(
+    f: &mut Frame,
+    area: Rect,
+    sample: &Sample,
+    shown: &[&RunningQuery],
+    state: &mut TableState,
+) {
+    if shown.is_empty() {
+        let text = if sample.running.is_empty() {
+            "no running queries"
+        } else {
+            NO_MATCH
+        };
+        return note(f, area, text);
     }
-    let rows = sample.running.iter().map(|q| {
+    let waiters = waiter_counts(sample);
+    let rows = shown.iter().map(|q| {
         let age = match q.secs {
             s if s >= 60.0 => THEME.crit,
             s if s >= 10.0 => THEME.warn,
             s if s >= 1.0 => THEME.text,
             _ => THEME.dim,
         };
+        // The marks come first: a state such as "Waiting for table metadata lock" is wider than
+        // its column, and what shows who waits for whom must not be what is cut off.
+        let mut state = lock_marks(&q.blocked_by, waiters.get(&q.id).copied().unwrap_or(0));
+        if !state.is_empty() {
+            state.push(Span::raw(" "));
+        }
+        state.push(Span::raw(q.state.as_str()));
         Row::new([
             Cell::from(q.id.to_string()),
             Cell::from(q.user.as_str()),
             Cell::from(q.db.as_str()),
             Cell::from(fmt_secs(q.secs)).style(fg(age)),
-            Cell::from(q.state.as_str()),
+            Cell::from(Line::from(state)),
             Cell::from(one_line(&q.sql)),
         ])
     });
@@ -455,7 +580,88 @@ fn running_table(f: &mut Frame, area: Rect, sample: &Sample, state: &mut TableSt
     f.render_stateful_widget(table, area, state);
 }
 
-fn slow_table(f: &mut Frame, area: Rect, sample: &Sample, state: &mut TableState) {
+/// What a session is doing in its transaction, in a word.
+fn trx_state(t: &OpenTransaction) -> (&'static str, Color) {
+    if t.state.contains("aborted") {
+        ("aborted", THEME.crit)
+    } else if t.idle {
+        // Idle with something held, or for long, is the one to look at.
+        let holding = t.rows_locked.is_some_and(|n| n > 0) || t.secs >= 10.0;
+        ("idle", if holding { THEME.warn } else { THEME.dim })
+    } else if t.state.eq_ignore_ascii_case("lock wait") || !t.blocked_by.is_empty() {
+        // Postgres calls a session that waits for a lock `active` too.
+        ("lock wait", THEME.warn)
+    } else {
+        ("running", THEME.text)
+    }
+}
+
+fn transactions_table(
+    f: &mut Frame,
+    area: Rect,
+    sample: &Sample,
+    shown: &[&OpenTransaction],
+    state: &mut TableState,
+) {
+    if sample.transactions.is_empty() {
+        return note(
+            f,
+            area,
+            sample
+                .transactions_note
+                .as_deref()
+                .unwrap_or("no open transactions"),
+        );
+    }
+    if shown.is_empty() {
+        return note(f, area, NO_MATCH);
+    }
+    let waiters = waiter_counts(sample);
+    let rows = shown.iter().map(|t| {
+        let (word, colour) = trx_state(t);
+        let locks = t
+            .rows_locked
+            .map_or("-".to_string(), |n| fmt_count(n as f64));
+        let locked = t.rows_locked.is_some_and(|n| n > 0);
+        Row::new([
+            Cell::from(t.id.to_string()),
+            Cell::from(t.user.as_str()),
+            Cell::from(fmt_secs(t.secs)).style(fg(age_colour(t.secs))),
+            Cell::from(word).style(fg(colour)),
+            Cell::from(locks).style(fg(if locked { THEME.text } else { THEME.dim })),
+            Cell::from(Line::from(lock_marks(
+                &t.blocked_by,
+                waiters.get(&t.id).copied().unwrap_or(0),
+            ))),
+            Cell::from(one_line(&t.sql)),
+        ])
+    });
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(14),
+        Constraint::Length(7),
+        Constraint::Length(10),
+        Constraint::Length(7),
+        Constraint::Length(11),
+        Constraint::Min(10),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header([
+            "ID", "USER", "AGE", "STATE", "LOCKS", "WAIT", "QUERY",
+        ]))
+        .row_highlight_style(selected())
+        .column_spacing(2);
+    f.render_stateful_widget(table, area, state);
+}
+
+fn slow_table(
+    f: &mut Frame,
+    area: Rect,
+    sample: &Sample,
+    shown: &[&SlowQuery],
+    state: &mut TableState,
+    sort: SlowSort,
+) {
     if sample.slow.is_empty() {
         return note(
             f,
@@ -466,7 +672,10 @@ fn slow_table(f: &mut Frame, area: Rect, sample: &Sample, state: &mut TableState
                 .unwrap_or("no slow queries recorded"),
         );
     }
-    let rows = sample.slow.iter().map(|q| {
+    if shown.is_empty() {
+        return note(f, area, NO_MATCH);
+    }
+    let rows = shown.iter().map(|q| {
         let avg = match q.avg_ms {
             ms if ms >= 1000.0 => THEME.crit,
             ms if ms >= 100.0 => THEME.warn,
@@ -498,35 +707,67 @@ fn slow_table(f: &mut Frame, area: Rect, sample: &Sample, state: &mut TableState
         Constraint::Length(5),
         Constraint::Min(10),
     ];
+    // The column the list is ranked by stands out.
+    let head = [
+        "DB",
+        "CALLS",
+        "TOTAL",
+        "AVG",
+        "MAX",
+        "ROWS EXAM",
+        "NOIDX",
+        "QUERY",
+    ]
+    .map(|name| {
+        let style = if name == sort.column() {
+            fg(THEME.accent).bold()
+        } else {
+            fg(THEME.dim).bold()
+        };
+        Cell::from(name).style(style)
+    });
     let table = Table::new(rows, widths)
-        .header(header([
-            "DB",
-            "CALLS",
-            "TOTAL",
-            "AVG",
-            "MAX",
-            "ROWS EXAM",
-            "NOIDX",
-            "QUERY",
-        ]))
+        .header(Row::new(head))
         .row_highlight_style(selected())
         .column_spacing(2);
     f.render_stateful_widget(table, area, state);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let key = |k: &'static str| Span::styled(k, fg(THEME.accent).bold());
-    let hint = |t: &'static str| Span::styled(t, fg(THEME.dim));
-    let hints = Line::from(vec![
-        key(" q"),
-        hint(" quit   "),
-        key("Tab"),
-        hint(" switch   "),
-        key("↑↓"),
-        hint(" move   "),
-        key("Enter"),
-        hint(" details"),
-    ]);
+    // The ones that cannot be guessed come first: a narrow terminal cuts the line at its end.
+    let keys = if app.filter.typing {
+        vec![("Enter", "keep"), ("Esc", "clear"), ("↑↓", "move")]
+    } else {
+        let mut keys = vec![
+            ("q", "quit"),
+            ("?", "help"),
+            ("Enter", "details"),
+            (
+                "/",
+                if app.filter.is_on() {
+                    "edit filter"
+                } else {
+                    "filter"
+                },
+            ),
+            ("Space", if app.paused() { "resume" } else { "pause" }),
+        ];
+        if app.filter.is_on() {
+            keys.push(("Esc", "clear"));
+        }
+        keys.extend([("Tab", "switch"), ("↑↓", "move")]);
+        keys
+    };
+    let mut hints = Vec::new();
+    for (i, (k, what)) in keys.into_iter().enumerate() {
+        hints.push(Span::raw(if i == 0 { " " } else { "   " }));
+        hints.push(Span::styled(k, fg(THEME.accent).bold()));
+        hints.push(Span::styled(format!(" {what}"), fg(THEME.dim)));
+    }
+    let hints = match app.notice() {
+        Some(notice) => Line::styled(format!(" {}", notice.text), notice_style(notice.failed)),
+        None => Line::from(hints),
+    };
     let status = match (&app.error, app.updated) {
         (Some(e), _) => Line::styled(format!("poll failed: {} ", one_line(e)), fg(THEME.crit)),
         (None, Some(at)) => {
@@ -537,10 +778,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Some(false) => spans.push(Span::styled(" · unencrypted", fg(THEME.warn))),
                 None => {}
             }
-            spans.push(Span::styled(
-                format!(" · {:.1}s ago ", at.elapsed().as_secs_f64()),
-                fg(THEME.dim),
-            ));
+            spans.push(match app.paused_since {
+                // Stale on purpose, so it must be hard to miss.
+                Some(since) => {
+                    let held = since.elapsed().as_secs();
+                    let held = if held < 60 {
+                        format!("{held}s")
+                    } else {
+                        fmt_secs(held as f64)
+                    };
+                    Span::styled(format!(" · PAUSED {held} "), fg(THEME.warn).bold())
+                }
+                None => Span::styled(
+                    format!(" · {:.1}s ago ", at.elapsed().as_secs_f64()),
+                    fg(THEME.dim),
+                ),
+            });
             Line::from(spans)
         }
         (None, None) => Line::styled(format!("{} · connecting… ", app.label), fg(THEME.dim)),
@@ -554,7 +807,72 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(status), right);
 }
 
+/// (keys, what they do). Rows with no keys are headings; with neither, a gap.
+const HELP: &[(&str, &str)] = &[
+    (
+        "↑↓ j k  PgUp PgDn  g G",
+        "move the cursor, or scroll the details",
+    ),
+    ("Tab  Shift+Tab  1 2 3", "switch between the lists"),
+    ("Enter", "open the details: full SQL, info and plan"),
+    ("Esc  q  Enter", "close the details"),
+    ("/", "filter: every word must match, Esc clears"),
+    ("s", "Slow list: rank by the next column"),
+    ("c", "copy the SQL (of the row or the details)"),
+    ("Space  p", "pause and resume the screen"),
+    ("q  Ctrl+C", "quit"),
+    ("", ""),
+    ("", "Locks, in the Running and Transactions lists"),
+    ("← 8841", "waits for session 8841"),
+    ("→ 2", "two sessions wait for this one"),
+];
+
+fn draw_help(f: &mut Frame, area: Rect) {
+    let keys_width = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+    let wide = HELP
+        .iter()
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(_, what)| keys_width + 3 + what.width())
+        .max()
+        .unwrap_or(0);
+    let width = u16::try_from(wide + 6).unwrap_or(u16::MAX).min(area.width);
+    let height = u16::try_from(HELP.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let popup = area
+        .centered_horizontally(Constraint::Length(width))
+        .centered_vertically(Constraint::Length(height));
+    f.buffer_mut()
+        .set_style(area, Style::new().add_modifier(Modifier::DIM));
+    f.render_widget(Clear, popup);
+
+    let block = panel(tag(vec![Span::styled(" help ", fg(THEME.accent).bold())]))
+        .border_style(fg(THEME.accent))
+        .title_bottom(Line::from(tag(vec![Span::styled(
+            " any key closes ",
+            fg(THEME.dim),
+        )])));
+    let lines: Vec<Line> = HELP
+        .iter()
+        .map(|&(keys, what)| match (keys, what) {
+            ("", heading) => Line::styled(heading, fg(THEME.accent).bold()),
+            _ => Line::from(vec![
+                Span::styled(format!("{keys:<keys_width$}   "), fg(THEME.accent)),
+                Span::styled(what, fg(THEME.text)),
+            ]),
+        })
+        .collect();
+    let inner = block.inner(popup).inner(Margin::new(2, 0));
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn notice_style(failed: bool) -> Style {
+    fg(if failed { THEME.warn } else { THEME.accent })
+}
+
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let notice = app.notice().map(|n| (n.text.clone(), n.failed));
     let Some(detail) = app.detail.as_mut() else {
         return;
     };
@@ -576,6 +894,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
             " digest {} ",
             slow.digest.chars().take(12).collect::<String>()
         ),
+        Subject::Transaction { trx, .. } => format!(" transaction #{} ", trx.id),
     };
     let block = panel(tag(vec![Span::styled(title, fg(THEME.accent).bold())]))
         .border_style(fg(THEME.accent));
@@ -585,13 +904,18 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
     detail.scroll = detail.scroll.min(max_scroll);
 
-    let mut hints = " ↑↓ PgUp PgDn scroll   g/G top/end   Esc close ".to_string();
+    let mut hints = " ↑↓ scroll   g/G top/end   c copy SQL   Esc close ".to_string();
     if max_scroll > 0 {
         let first = detail.scroll + 1;
         let last = (detail.scroll + usize::from(inner.height)).min(lines.len());
         hints = format!(" lines {first}-{last} of {} │{hints}", lines.len());
     }
-    let block = block.title_bottom(Line::from(tag(vec![Span::styled(hints, fg(THEME.dim))])));
+    // What became of a copy is told where the eyes are, in place of the keys.
+    let bottom = match notice {
+        Some((text, failed)) => Span::styled(format!(" {text} "), notice_style(failed)),
+        None => Span::styled(hints, fg(THEME.dim)),
+    };
+    let block = block.title_bottom(Line::from(tag(vec![bottom])));
 
     f.render_widget(block, popup);
     let scroll = u16::try_from(detail.scroll).unwrap_or(u16::MAX);
@@ -603,11 +927,16 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
     let value = fg(THEME.text);
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    if let Subject::Running { finished: true, .. } = &detail.subject {
-        out.push(Line::styled(
+    match &detail.subject {
+        Subject::Running { finished: true, .. } => out.push(Line::styled(
             "finished: this statement is no longer running",
             fg(THEME.warn),
-        ));
+        )),
+        Subject::Transaction { finished: true, .. } => out.push(Line::styled(
+            "finished: this transaction has ended",
+            fg(THEME.warn),
+        )),
+        _ => {}
     }
     let info = info_rows(&detail.subject);
     let key_width = info.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -623,6 +952,7 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
     let (sql, truncated) = match &detail.subject {
         Subject::Running { query, .. } => (query.sql.as_str(), query.truncated),
         Subject::Slow(slow) => (slow.sample_sql.as_str(), slow.truncated),
+        Subject::Transaction { trx, .. } => (trx.sql.as_str(), trx.truncated),
     };
     if truncated {
         out.push(Line::styled(
@@ -630,8 +960,22 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
             fg(THEME.warn),
         ));
     }
+    if let Subject::Transaction { trx, .. } = &detail.subject {
+        if trx.sql.is_empty() {
+            out.push(Line::styled("not known", label));
+        } else if trx.idle {
+            out.push(Line::styled(
+                "the last statement this session ran: the locks may come from an earlier one",
+                label,
+            ));
+        }
+    }
     out.extend(highlight(sql, width));
 
+    // A transaction is not a statement: there is no plan to ask for.
+    if matches!(detail.plan, PlanState::NotAsked) {
+        return out;
+    }
     out.push(Line::raw(""));
     out.push(section("Plan", width));
     // Sentences wrap at spaces; a plan keeps its layout.
@@ -653,6 +997,7 @@ fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
             out.extend(prose(&format!("not available: {why}"), fg(THEME.warn)));
         }
         PlanState::Failed(e) => out.extend(prose(&format!("EXPLAIN failed: {e}"), fg(THEME.crit))),
+        PlanState::NotAsked => {}
     }
     out
 }
@@ -812,6 +1157,47 @@ fn info_rows(subject: &Subject) -> Vec<(String, String)> {
             rows.extend(q.details.iter().cloned());
             rows
         }
+        Subject::Transaction {
+            trx: t, blocking, ..
+        } => {
+            let ids = |ids: &[u64]| {
+                ids.iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut rows = vec![
+                ("user".to_string(), format!("{}@{}", t.user, t.host)),
+                ("db".to_string(), t.db.clone()),
+                ("open for".to_string(), fmt_secs(t.secs)),
+                (
+                    "session".to_string(),
+                    if t.idle {
+                        "idle: between statements"
+                    } else {
+                        "running a statement"
+                    }
+                    .to_string(),
+                ),
+                ("state".to_string(), t.state.clone()),
+            ];
+            if let (Some(locked), Some(modified)) = (t.rows_locked, t.rows_modified) {
+                rows.push((
+                    "rows".to_string(),
+                    format!("{locked} locked, {modified} modified"),
+                ));
+            }
+            if !t.blocked_by.is_empty() {
+                rows.push(("waits for".to_string(), ids(&t.blocked_by)));
+            }
+            if !blocking.is_empty() {
+                rows.push((
+                    "others wait".to_string(),
+                    format!("{} ({})", blocking.len(), ids(blocking)),
+                ));
+            }
+            rows
+        }
         Subject::Slow(s) => vec![
             ("schema".to_string(), s.schema.clone()),
             ("digest".to_string(), s.digest.clone()),
@@ -852,7 +1238,7 @@ mod tests {
     use super::*;
     use crate::backend::{Backend, fake::Fake};
     use crate::collector::{Msg, Req};
-    use crate::model::{Raw, Reading, Sample, SlowQuery};
+    use crate::model::{Raw, Reading, RunningQuery, Sample, SlowQuery};
 
     fn loaded() -> (App, Fake) {
         let mut fake = Fake::seeded(3);
@@ -924,6 +1310,25 @@ mod tests {
     fn draws_before_the_first_poll() {
         let mut app = App::new("test".into());
         assert!(screen(&mut app, 100, 30).contains("connecting"));
+    }
+
+    #[test]
+    fn the_column_the_slow_list_is_ranked_by_stands_out() {
+        let (mut app, _) = loaded();
+        press(&mut app, KeyCode::Char('2'));
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let colour_of = |app: &mut App, terminal: &mut Terminal<TestBackend>, name: &str| {
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let (x, y) = find(buffer, name).unwrap_or_else(|| panic!("no {name} header"));
+            buffer[(x, y)].fg
+        };
+        assert_eq!(colour_of(&mut app, &mut terminal, "TOTAL"), THEME.accent);
+        assert_eq!(colour_of(&mut app, &mut terminal, "AVG"), THEME.dim);
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(colour_of(&mut app, &mut terminal, "AVG"), THEME.accent);
+        assert_eq!(colour_of(&mut app, &mut terminal, "TOTAL"), THEME.dim);
     }
 
     #[test]
@@ -1025,6 +1430,276 @@ mod tests {
                 row(["1", "SIMPLE", "c", "NULL", "eq_ref", "PRIMARY", "1", "NULL"]),
             ],
         }
+    }
+
+    fn open_transaction(
+        id: u64,
+        user: &str,
+        secs: f64,
+        idle: bool,
+        locked: u64,
+        sql: &str,
+    ) -> OpenTransaction {
+        OpenTransaction {
+            id,
+            user: user.into(),
+            host: "10.0.0.8".into(),
+            db: "settlement".into(),
+            secs,
+            idle,
+            state: "RUNNING".into(),
+            rows_locked: Some(locked),
+            rows_modified: Some(locked),
+            sql: sql.into(),
+            truncated: false,
+            blocked_by: vec![],
+        }
+    }
+
+    fn running_query(id: u64, secs: f64, sql: &str, blocked_by: Vec<u64>) -> RunningQuery {
+        RunningQuery {
+            id,
+            user: "app".into(),
+            host: "10.0.0.9".into(),
+            db: "settlement".into(),
+            state: "updating".into(),
+            secs,
+            sql: sql.into(),
+            truncated: false,
+            details: vec![],
+            blocked_by,
+        }
+    }
+
+    /// A session idle in a transaction that holds rows, another idle one that holds nothing, and
+    /// an update that waits for the first.
+    fn lock_scene(fake: &mut Fake) -> Sample {
+        let mut sample = fake.poll().unwrap();
+        let mut waiter =
+            open_transaction(8800, "app", 30.0, false, 0, "UPDATE settlement SET a = 1");
+        waiter.state = "LOCK WAIT".into();
+        waiter.blocked_by = vec![7711];
+        sample.running = vec![running_query(
+            8800,
+            30.0,
+            "UPDATE settlement SET a = 1",
+            vec![7711],
+        )];
+        sample.transactions = vec![
+            open_transaction(
+                7711,
+                "batch",
+                125.0,
+                true,
+                1204,
+                "UPDATE settlement SET status = 'HOLD' WHERE batch = 7731",
+            ),
+            waiter,
+            open_transaction(7712, "reader", 3.0, true, 0, "SELECT 1"),
+        ];
+        sample
+    }
+
+    /// The table row that starts with `id`.
+    fn row_of<'a>(screen: &'a str, id: &str) -> &'a str {
+        screen
+            .lines()
+            .find(|l| {
+                l.trim_start_matches('"')
+                    .trim_start_matches('│')
+                    .trim_start()
+                    .starts_with(id)
+            })
+            .unwrap_or_else(|| panic!("no row for {id} in:\n{screen}"))
+    }
+
+    #[test]
+    fn the_transactions_tab_lists_the_oldest_first_and_says_who_waits_for_whom() {
+        let (mut app, mut fake) = loaded();
+        let sample = lock_scene(&mut fake);
+        send(&mut app, sample);
+        press(&mut app, KeyCode::Char('3'));
+        let screen = screen(&mut app, 150, 40);
+
+        assert!(screen.contains(" 3 transactions 3 "), "{screen}");
+        let at = |id: &str| screen.find(row_of(&screen, id)).unwrap();
+        assert!(
+            at("7711") < at("8800") && at("8800") < at("7712"),
+            "oldest first"
+        );
+
+        let holder = row_of(&screen, "7711");
+        assert!(
+            holder.contains("batch") && holder.contains("idle") && holder.contains("1.2k"),
+            "{holder}"
+        );
+        assert!(holder.contains("→ 1"), "one session waits for it: {holder}");
+        let waiter = row_of(&screen, "8800");
+        assert!(
+            waiter.contains("lock wait") && waiter.contains("← 7711"),
+            "{waiter}"
+        );
+        let quiet = row_of(&screen, "7712");
+        assert!(!quiet.contains('→') && !quiet.contains('←'), "{quiet}");
+    }
+
+    #[test]
+    fn a_session_that_waits_for_another_is_in_lock_wait_whatever_the_server_calls_it() {
+        let mut t = open_transaction(1, "u", 5.0, false, 0, "x");
+        t.state = "active".into();
+        assert_eq!(trx_state(&t), ("running", THEME.text));
+        t.blocked_by = vec![9];
+        assert_eq!(trx_state(&t), ("lock wait", THEME.warn));
+
+        let mut idle = open_transaction(2, "u", 50.0, true, 0, "x");
+        assert_eq!(trx_state(&idle), ("idle", THEME.warn), "idle for long");
+        idle.secs = 3.0;
+        assert_eq!(
+            trx_state(&idle),
+            ("idle", THEME.dim),
+            "idle for a moment, holding nothing"
+        );
+        idle.rows_locked = Some(5);
+        assert_eq!(
+            trx_state(&idle),
+            ("idle", THEME.warn),
+            "idle and holding rows"
+        );
+        idle.state = "idle in transaction (aborted)".into();
+        assert_eq!(trx_state(&idle), ("aborted", THEME.crit));
+    }
+
+    #[test]
+    fn the_running_list_marks_a_waiter_and_whoever_makes_it_wait() {
+        let (mut app, mut fake) = loaded();
+        let mut sample = lock_scene(&mut fake);
+        sample.running = vec![
+            running_query(8805, 40.0, "UPDATE a SET x = 1", vec![]),
+            running_query(8806, 20.0, "UPDATE a SET x = 2", vec![8805]),
+            running_query(8807, 10.0, "UPDATE a SET x = 3", vec![8805, 8806]),
+        ];
+        sample.transactions.clear();
+        send(&mut app, sample);
+        let screen = screen(&mut app, 150, 40);
+
+        let blocker = row_of(&screen, "8805");
+        assert!(
+            blocker.contains("→ 2") && !blocker.contains('←'),
+            "{blocker}"
+        );
+        let waiter = row_of(&screen, "8806");
+        assert!(
+            waiter.contains("← 8805 → 1 updating"),
+            "it waits for one and is waited for by one: {waiter}"
+        );
+        let two = row_of(&screen, "8807");
+        assert!(two.contains("← 8805+1 updating"), "{two}");
+    }
+
+    #[test]
+    fn an_old_transaction_is_yellow_on_its_row_and_on_the_tab_that_holds_it() {
+        let (mut app, mut fake) = loaded();
+        let sample = lock_scene(&mut fake);
+        send(&mut app, sample);
+
+        // The Running tab is open: the third tab still warns, as the Oldest Xact graph does.
+        let mut terminal = Terminal::new(TestBackend::new(150, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let (x, y) = find(terminal.backend().buffer(), " 3 transactions").unwrap();
+        assert_eq!(terminal.backend().buffer()[(x + 2, y)].fg, THEME.warn);
+
+        press(&mut app, KeyCode::Char('3'));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find(buffer, "2m05s").expect("the holder's age");
+        assert_eq!(buffer[(x, y)].fg, THEME.warn, "125 s");
+        let (x, y) = find(buffer, "30.0s").expect("the waiter's age");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            THEME.text,
+            "under a minute is not alarming"
+        );
+    }
+
+    #[test]
+    fn an_empty_transactions_tab_says_so_and_a_note_says_why() {
+        let (mut app, mut fake) = loaded();
+        press(&mut app, KeyCode::Char('3'));
+        let mut sample = fake.poll().unwrap();
+        sample.transactions.clear();
+        send(&mut app, sample.clone());
+        assert!(screen(&mut app, 120, 40).contains("no open transactions"));
+
+        sample.transactions_note = Some("cannot read InnoDB transactions: denied".into());
+        send(&mut app, sample);
+        let shown = screen(&mut app, 120, 40);
+        assert!(
+            shown.contains("cannot read InnoDB transactions: denied"),
+            "{shown}"
+        );
+        assert!(!shown.contains("no open transactions"));
+
+        // With a list the note is a warning above it.
+        let mut with_list = lock_scene(&mut fake);
+        with_list.transactions_note = Some("what an idle session ran last is not known".into());
+        send(&mut app, with_list);
+        let shown = screen(&mut app, 150, 40);
+        assert!(
+            shown.contains("⚠ what an idle session ran last is not known"),
+            "{shown}"
+        );
+        assert!(shown.contains("7711"));
+    }
+
+    #[test]
+    fn a_transactions_details_show_its_session_and_whoever_waits_and_no_plan() {
+        let (mut app, mut fake) = loaded();
+        let sample = lock_scene(&mut fake);
+        send(&mut app, sample);
+        press(&mut app, KeyCode::Char('3'));
+        let asked = press(&mut app, KeyCode::Enter);
+        assert!(asked.try_recv().is_err());
+
+        let text = plain(&detail_lines(app.detail.as_ref().unwrap(), 120)).join("\n");
+        for expected in [
+            "batch@10.0.0.8",
+            "2m05s",
+            "idle: between statements",
+            "1204 locked, 1204 modified",
+            "others wait  1 (#8800)",
+            "── SQL",
+            "the last statement this session ran",
+            "UPDATE settlement SET status = 'HOLD'",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(
+            !text.contains("── Plan"),
+            "a transaction has no plan:\n{text}"
+        );
+
+        // The one that waits says what for.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let text = plain(&detail_lines(app.detail.as_ref().unwrap(), 120)).join("\n");
+        assert!(
+            text.contains("waits for") && text.contains("#7711"),
+            "{text}"
+        );
+        assert!(text.contains("running a statement"), "{text}");
+    }
+
+    #[test]
+    fn a_statement_that_is_not_known_says_so() {
+        let (mut app, mut fake) = loaded();
+        let mut sample = lock_scene(&mut fake);
+        sample.transactions[0].sql = String::new();
+        send(&mut app, sample);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        let text = plain(&detail_lines(app.detail.as_ref().unwrap(), 120)).join("\n");
+        assert!(text.contains("not known"), "{text}");
     }
 
     #[test]
@@ -1332,6 +2007,152 @@ mod tests {
                 "{encrypted:?}: {footer}"
             );
         }
+    }
+
+    fn type_into_filter(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn the_filter_sits_in_the_tables_border_and_the_tabs_count_what_it_lets_through() {
+        let (mut app, mut fake) = loaded();
+        let sample = lock_scene(&mut fake);
+        send(&mut app, sample);
+        press(&mut app, KeyCode::Char('/'));
+        type_into_filter(&mut app, "settlement update");
+
+        let typing = screen(&mut app, 150, 40);
+        let border = typing.lines().find(|l| l.contains("1 running")).unwrap();
+        assert!(border.contains("/ settlement update█"), "{border}");
+        let footer = typing.lines().last().unwrap();
+        assert!(
+            footer.contains("Enter keep") && footer.contains("Esc clear"),
+            "{footer}"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let kept = screen(&mut app, 150, 40);
+        let border = kept.lines().find(|l| l.contains("1 running")).unwrap();
+        assert!(
+            border.contains("/ settlement update") && !border.contains('█'),
+            "no cursor once typing is over: {border}"
+        );
+        assert!(
+            border.contains(" 3 transactions 2/3 "),
+            "the one that does not match is left out of the count: {border}"
+        );
+        let footer = kept.lines().last().unwrap();
+        assert!(
+            footer.contains("edit filter") && footer.contains("Esc clear"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn a_filter_that_lets_nothing_through_says_so_and_how_to_get_the_rows_back() {
+        let (mut app, _) = loaded();
+        press(&mut app, KeyCode::Char('/'));
+        type_into_filter(&mut app, "no such thing anywhere");
+        press(&mut app, KeyCode::Enter);
+        for tab in [Tab::Running, Tab::Slow, Tab::Transactions] {
+            app.tab = tab;
+            let shown = screen(&mut app, 120, 40);
+            assert!(
+                shown.contains("nothing matches the filter  ·  Esc clears it"),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_that_the_filter_hides_still_counts_as_waiting() {
+        let (mut app, mut fake) = loaded();
+        let sample = lock_scene(&mut fake);
+        send(&mut app, sample);
+        press(&mut app, KeyCode::Char('/'));
+        type_into_filter(&mut app, "batch");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('3'));
+
+        let screen = screen(&mut app, 150, 40);
+        assert!(!screen.contains("8800"), "the waiter is filtered out");
+        assert!(
+            row_of(&screen, "7711").contains("→ 1"),
+            "but the holder still says someone waits for it:
+{screen}"
+        );
+    }
+
+    #[test]
+    fn the_help_lists_every_key_and_fits_the_smallest_screen() {
+        let (mut app, _) = loaded();
+        press(&mut app, KeyCode::Char('?'));
+        for (width, height) in [(80, 20), (120, 40)] {
+            let shown = screen(&mut app, width, height);
+            for (keys, what) in HELP {
+                assert!(
+                    shown.contains(keys) && shown.contains(what),
+                    "{width}x{height}: {keys:?} {what:?} in\n{shown}"
+                );
+            }
+        }
+        let shown = screen(&mut app, 80, 20);
+        assert!(shown.contains("any key closes"), "{shown}");
+        assert!(
+            shown.lines().all(|l| !l.contains("1 running")),
+            "the help is on top of the lists, which are dimmed behind it:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn what_became_of_a_copy_replaces_the_hints_in_the_details_and_in_the_footer() {
+        use crate::app::ToCopy;
+        use crate::clipboard::Copied;
+        let (mut app, _) = loaded();
+        let copy = ToCopy {
+            sql: "SELECT 1".into(),
+            cut: false,
+        };
+
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 120, 40).contains("c copy SQL"));
+
+        app.copied(&copy, Ok(Copied::Clipboard));
+        let shown = screen(&mut app, 120, 40);
+        assert!(
+            shown.contains("copied the SQL (8 characters)") && !shown.contains("c copy SQL"),
+            "{shown}"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        let shown = screen(&mut app, 120, 40);
+        let footer = shown.lines().last().unwrap();
+        assert!(footer.contains("copied the SQL (8 characters)"), "{footer}");
+        assert!(!footer.contains("Space pause"), "{footer}");
+    }
+
+    #[test]
+    fn the_footer_says_when_the_screen_is_held_still_and_which_key_lets_it_go() {
+        let (mut app, _) = loaded();
+        let last_line = |app: &mut App| screen(app, 120, 40).lines().last().unwrap().to_string();
+        let footer = last_line(&mut app);
+        assert!(
+            footer.contains("Space pause") && footer.contains("s ago"),
+            "{footer}"
+        );
+
+        press(&mut app, KeyCode::Char(' '));
+        let footer = last_line(&mut app);
+        assert!(
+            footer.contains("PAUSED 0s") && footer.contains("Space resume"),
+            "{footer}"
+        );
+        assert!(!footer.contains("s ago"), "{footer}");
+
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!last_line(&mut app).contains("PAUSED"));
     }
 
     #[test]
